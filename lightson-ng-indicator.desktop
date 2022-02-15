@@ -1,0 +1,17 @@
+[Desktop Entry]
+# Icon=$HOME/.local/share/JetBrains/Toolbox/toolbox.svg
+Exec=/usr/local/bin/lightson-ng-indicator.py
+Version=1.0
+Type=Application
+Categories=Utility;System;Application
+Encoding=UTF-8
+Name=Lightson-ng indicator GUI
+Comment=control and monitor lightson-ng backend
+StartupWMClass=lightson-ng-indicator
+Terminal=false
+X-GNOME-Autostart-enabled=true
+StartupNotify=false
+X-GNOME-Autostart-Delay=10
+X-MATE-Autostart-Delay=10
+X-KDE-autostart-after=panel
+

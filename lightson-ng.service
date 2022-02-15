@@ -1,0 +1,18 @@
+# (c) 2021 grytsenko.alexander at gmail com: lightsOn - sleep mode and screen lock prevention
+# edit file: /usr/local/etc/lightson-ng.service
+# link this file to /etc/systemd/system directory
+# execute: systemctl enable lightson-ng.service; service lightson-ng start
+# after changes applied: service lightson-ng stop; systemctl daemon-reload; service lightson-ng start
+[Unit]
+Description=lightson-ng service - prevent sleep and screen lock
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/environment
+Environment=HOME=/root
+ExecStart=/usr/local/bin/lightson-ng --quiet
+ExecStop=bash -c "kill $(cat /tmp/lightson-ng-0-.pid)"
+
+[Install]
+WantedBy=multi-user.target

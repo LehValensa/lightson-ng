@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+# Script to install lightson-ng.
+set -o errexit -o verbose
+
+# Installation dirs.
+INSTALL_BIN="/usr/local/bin/"
+# INSTALL_DBUS_PERMISSIONS="/usr/share/dbus-1/system.d/"
+INSTALL_DBUS_PERMISSIONS="/etc/dbus-1/system.d/"
+INSTALL_SYSTEMD_SERVICE="/lib/systemd/system/"
+
+# Packages required
+ADD_DPKG="net-tools sysstat gir1.2-appindicator3-0.1 gnome-icon-theme"
+
+# lightson main program.
+PROG="lightson-ng"
+
+# lightson's service name
+SERVICE="$PROG"
+
+# GUI indicator for lightson.
+PROG_INDICATOR="${PROG}-indicator.py"
+
+# Stat module.
+PROG_STAT="${PROG}-stat.py"
+
+# Fix permissions in systemd to allow run lightson-ng-stat as system service:
+STAT_PERM="${PROG}-stat.conf"
+
+# lightson-ng main service
+SERVICE_FILE="${SERVICE}.service"
+
+[ "$USER" != "root" ] && {
+    echo "root permissions required to install lightson-ng"
+    exit 1
+}
+
+apt install $ADD_DPKG
+
+# Copy
+# TODO: try "install" command to improve reduce the amount of code.
+cp "${PROG}" "$INSTALL_BIN"
+cp "${PROG_STAT}" "$INSTALL_BIN"
+cp "${PROG_INDICATOR}" "$INSTALL_BIN"
+chmod a+rx "${INSTALL_BIN}"/${PROG}*
+cp "$SERVICE_FILE" "$INSTALL_SYSTEMD_SERVICE"
+cp "$STAT_PERM" "$INSTALL_DBUS_PERMISSIONS"
+
+# Reload dbus config to add permissions for stat module.
+systemctl reload dbus
+
+# To add the main lightson-ng service into systemd.
+systemctl daemon-reload
+
+# Enable service at boot.
+systemctl enable "$SERVICE_FILE"
+
+# Start the service at the end of installation.
+service ${SERVICE} restart
+
+echo "Installation successful"
+
+# To autolaunch lightson-ng-indicator at login:
+# cp lightson-ng-indicator.desktop $HOME/.local/share/applications/
+# ln -sf $HOME/.local/share/applications/lightson-ng-indicator.desktop $HOME/.config/autostart/

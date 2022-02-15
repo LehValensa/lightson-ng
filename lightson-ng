@@ -1,0 +1,2112 @@
+#!/usr/bin/env bash
+
+# lightson-ng - lightsOn.sh New Generation
+#
+# Copyright (c) 2022 grytsenko.alexander at gmail com
+# url: https://github.com/LehValensa/lightson-ng
+# This script is licensed under GNU GPL version 2.0 or above
+#
+# Based on:
+# Copyright (c) 2018 spinal.by at gmail com
+# Copyright (c) 2014 devkral at web de
+# url: https://github.com/devkral/lightsonplus
+# Copyright (c) 2011 iye.cba at gmail com
+# url: https://github.com/iye/lightsOn
+#
+# https://github.com/UMLAUTaxl/lightsOn
+
+# Description: Bash script that prevents Power Management idle/sleep modes
+# and/or the screensaver and display power management (DPMS) from being activated
+# by checking if system is performing specified actions, such as:
+# - running specific programs, ex. Transmission, rsnapshot backup.
+# - while watching fullscreen videos on Firefox, Chrome and Chromium.
+#   Media players like mplayer, VLC and minitube can also be detected.
+# - when MPRIS Media Player is playing. Example: YouTube will be detected when playing, since YouTube uses MPRIS in backend.
+# - when audio is playing via Pulse audio or via ALSA (TODOFEATURE: jackd).
+# - when CPU/Network load is high (TODOFEATURE: disk load)
+# - when network connection exists, ex. when PC acts as home DLNA server and TV is playing movie from PC.
+# - when inhibit-file exists in /tmp/ directory.
+# TODOFEATURE: execute the screen lock when user goes away from the PC - detected by webcam when no movements.
+
+# Usage:
+# "./lightson-ng -d 120 &" will perform checks every 2 minutes.
+# If you don't pass an argument, the default value specified in $loopDelay is taken.
+# - lightson-ng can be added to the session auto-launch, or can be configured as a service started at boot.
+# In later case PC will prevent sleep even if no users are logged in. It helps if PC is used as DLNA server,
+# so it will not go sleep in the middle of the movie.
+# Hint: use -v option to display debug messages for troubleshooting.
+
+# Functionality:
+# - Each check of the script can disable idle or sleep modes, or both of them. If at least one check has found the reason to disable specific mode,
+#   then the mode is disabled by setting idle/sleep inhibitor. If GUI session is running, then Gnome's inhibitor is set,
+#   otherwise - systemd inhibitor is set. GUI session is not running when no user is logged into X/Gnome/Unity... session.
+#   A separate inhibitor is set for every mode: idle or sleep.
+#   Inhibitor is removed when no check returned a reason to disable idle/sleep state and upon lightson exit.
+
+# - script reads configuration file, if it exists in predefined directories or specified in the arguments to lightson.
+#   Config allows to:
+#   - enable/disable every check.
+#   - specify the additional parameters for check, such as:
+#       - list of IPs for network connection check.
+#       - name of network interface to check load on.
+#       - max CPU/network usage values.
+#       - check audio on Pulse and/or ALSA card.
+#   - specify different modes of operation, such as:
+#       - force using DelayScreensaver instead of inhibitors. Not recommended, but may help if inhibitors are not supported by system.
+#       - use dynamic adjustment of loop delay between iterations.
+#       - load configuration file within every iteration to allow reconfiguring lightson without restart.
+#   - add the new custom checks, on top of existing. Even action handler can be overwritten in config file.
+#   - specify logging options: show messages on screen, write them to logfile or both, or none.
+# - Recover PM settings in gnome, if something is broken in Power Management settings of GDM user (one that is used when no user is logged in).
+
+# - Statistics collected by lightson-ng is sent to the DBUS service lightson-ng-stat.
+#   Statistics contains (but not limited to):
+#       - status info for: state idle/sleep enabled/disabled
+#       - PIDs of lightson and all inhibitors set
+#   Status is read by panel indicator lighting "XX" if PM states are disabled and "--" if all states are enabled.
+#   TODOFEATURE: perhaps, another light indicating existence of ERROR messages.
+
+# Compatibility:
+# Current version of lightson-ng is working fine on Ubuntu Desktop 20.04 LTS using standard installation options: Gnome 3 desktop, python 3, systemd, dbus, upowerd.
+# Another configurations/distributions may require playing with configuration parameters or code adaptation.
+
+# TODOFEATURE: for those who care about security - when launching lightson as system service at boot, do not use root user.
+#       But instead, create special user "lightson". Add corresponding sudoers for adding/killing inhibitors
+#       and launch the script under "lightson" user.
+
+
+# ********************* Below are configurable variables
+
+# Check all applications running in fullscreen.
+detectFullscreenAppPlaying=1
+
+# Select individual programs to be checked in FullscreenAppPlaying check.
+detectFsMplayer=0
+detectFsPlex=0
+detectFsVlc=1
+detectFsTotem=1
+detectFsFirefoxFlash=1
+detectFsChromiumFlash=1
+#detectFsChromeAppName="Netflix"
+detectFsWebkitFlash=1
+detectFsHtml5=1
+detectFsStream=0
+detectFsMiniTube=0
+detectFsAudioStreaming=1
+
+# Check if audio is playing.
+detectAudioPlaying=1
+# Select individual audio servers to check in AudioPlaying check.
+detectPlayingViaAlsa=1
+detectPlayingViaPulse=1
+# ALSA sound card where detect sound on.
+alsaCardStatus="/proc/asound/card0/pcm0p/sub0/status"
+
+# Check if program from delay list is running.
+detectDelayProgRunning=1
+# Delay list for DelayProgRunning check.
+# Names of programs which, when running, you wish to disable idle/sleep modes.
+# For example ('ardour2' 'gmpc')
+delayProg=('transmission-gtk')
+
+# Check if network load is high.
+detectNetworkLoadHigh=1
+# Max usage of network interface for NetworkLoadHigh check.
+# In percents of possible utilization of given interface.
+# Usually, limit of 0.1 is more than Youtube may utilize on 1GBit network card.
+ifUsageMax="0.1"
+# A list of network interfaces to check load on.
+# Card names are taken from ifconfig command.
+# interfaceList=("eno1")
+# Guess interface name from default route:
+interfaceList=("$( route | grep default | awk '{ print $8; }' )")
+
+# Gather network statistics time, in seconds.
+netStatGatherTime=3
+
+# Check if network connection exists.
+detectNetworkConnectionExists=1
+# A list of remote PCs/devices connected to this PC.
+# When they are connected - lights should be On.
+# Example: remoteIpList=('1.1.1.1' '2.2.2.2')
+remoteIpList=()
+
+# Check if CPU load is high.
+detectCpuLoadHigh=1
+# Max CPU load average.
+# Note: load average is not normalized for the number of CPUs in a system,
+# so a load average of 1 means a single CPU system is loaded all the time
+# while on a 4 CPU system it means it was idle 75% of the time.
+cpuLoadMax=2
+
+# Check if inhibit-file exists.
+# Inhibit file is set externally: either manually or by some program.
+# Example use: touch /tmp/lightson-ng-inhibit-0-
+detectInhibitFileExist=1
+
+# Check if MPRIS Media Player is playing in backend.
+# MPRIS is a service that is used by several applications, including Chrome.
+# Example: when Chrome is playing Youtube - MPRIS Media Player is used.
+detectMediaPlayerPlaying=1
+
+
+# Print messages on screen.
+logStdout=1
+
+# Print messages to logfile.
+logSyslog=1
+
+# The fixed delay that program makes between check iterations, in seconds.
+# Note: the loop delay should be less than the idle time configured in the system.
+#       Otherwise a system may switch to the idle state even when it is not expected.
+#       Well, there is no 100% guarantee that a short loop delay will prevent transition to idle/sleep.
+#       See $dynamicLoopDelay below for a better solution.
+#       In general, more frequent checks reduce probability to miss PM state change.
+#       But it leads to increasing the CPU usage.
+loopDelay=60
+
+# Adjust the loop delay dynamically, depending on idle time configured in the system and the idle timer.
+# This way checks will run as frequently as needed, no more.
+# Using dynamic delay the chances to miss the transition to idle/sleep are minimal.
+# Only the $loopSpareTime has a little influence, but it is needed to perform checks.
+# Dynamic delay is preferable over static, if all controls (such as upowerd and necessary DBUS services)
+# are available in the system.
+dynamicLoopDelay=1
+
+# The loop delay is $loopSpareTime seconds less than the time it takes to activate your
+# screensaver or Power Management.
+# Spare time is reserved for performing checks. But it should be set as low as possible.
+# Increasing spare time increases chances to miss PM state transition.
+# Leave it as is if unsure.
+loopSpareTime=10
+
+# The minimum possible delay between check iterations, in seconds.
+# Leave it as is if unsure.
+loopMinDelay=60
+
+# Show debug messages. Useful for troubleshooting.
+debugMode=0
+
+# Show all dbus messages and signals from stats module.
+debugDbusExtra=0
+
+# Load config file within every iteration,
+# so parameters can be dynamically changed, without need to restart.
+dynamicConfig=0
+
+# Set this flag to 1 to restore default Power Management settings into GDM schema.
+# It may be needed due to incorrect behaviour of some software/human actions.
+# After restore, system will be able to go into sleep mode if no user is logged into X session
+# (i.e. when PC just booted).
+# Default values restored:
+# sleep time on AC = sleep time on battery = 30 min.
+# default action on AC/battery = suspend.
+restoreDefaultPmSettingsInGdm=0
+
+# Default settings to be restored in GDM schema.
+gdmSleepInactiveAcType="'suspend'"                  # org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type
+gdmSleepInactiveAcTimeout="901"                     # org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout
+gdmSleepInactiveBatteryType="'suspend'"             # org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type
+gdmSleepInactiveBatteryTimeout="1800"               # org.gnome.settings-daemon.plugins.power sleep-inactive-battery-timeout
+# Path to GDM schema where settings will be restored.
+gPathPower="org.gnome.settings-daemon.plugins.power"
+
+# Path of GUI session where idle-delay can be found. Used in dynamic sleep delay.
+gPathSession="org.gnome.desktop.session"
+
+# User which holds system-wide power management settings.
+gdmUser="gdm"
+
+# Force using delayScreensaver() instead of inhibitor, even if setting inhibitors is possible.
+# Note: if set, then PM states are not prevented when no GUI session is running, since there are no screensaver activated yet.
+# For gnome3 delaying screensaver works, screensaver does not activate idle mode, screen remains unlocked, but screen blanks, even if DPMS is off.
+# Another drawback with gnome3: delayScreensaver has no influence on sleep mode: PC goes into sleep even if screensaver is delayed by SimulateUserActivity.
+# Hoping, non-gnome3 systems have no such drawback and delaying screensaver delays sleep correspondingly.
+# FIXME: check the bug: sleep mode is not disabled by delayScreensaver? Or it is intended functionality of Linux?
+forceDelayScreensaver=0
+
+# When delaying the screensaver also delay DPMS.
+# Set to 1 if forceDelayScreensaver is set to 1
+forceDelayDpms=0
+
+# Do not use gnome-inhibitor, but systemd-inhibit.
+forceSkipGnomeInhibitor=0
+
+# Force using a custom state disable/enable functions that can be put into config file.
+forceHandleStateCustom=0
+
+# Set standard inhibitors after calling custom function.
+continueWithHandleStateStandard=0
+
+# Time to wait (in seconds) until the process is created or exited.
+# Usually, no need to tune it, but who knows...
+waitDelay=1
+
+# Add a separate lightson check to systemd sleep chain.
+# Note: a separate lightson process will start and it will prevent sleep mode only when no GUI available.
+# Leave default values if unsure.
+forceLateCheckService=1
+# The name of service created in systemd sleep chain.
+lateCheckServiceName="lightson-ng-late-check.service"
+# Timeout in seconds systemd will wait late check service to finish.
+lateCheckTimeout=20
+
+# Launch lightson's statistics module and send stats to it.
+# Statistics is retrieved then by lightson-ng-indicator program.
+useDbusStatsFlag=1
+
+# ******************** Below are non configurable variables
+# YOU SHOULD NOT NEED TO MODIFY ANYTHING BELOW THIS LINE
+
+# Mark log messages with tag.
+# Also, this tag is used to create filenames of temporary files.
+lightsOnLogTag="lightson-ng"
+
+# A list of function names of all checks to perform.
+# All functions that perform checks should be registered here.
+# Each function should have one or more actions assigned.
+# If no actions assigned - check will not be performed.
+
+declare -A ACTION_MASK=( ["idle"]=1 ["sleep"]=2 )     # Disable idle/sleep states if check is true.
+GUI_REQUIRED_MASK=4                                   # GUI is required to perform the check.
+                                                      # Check will be skipped if GUI is not available.
+declare -A checkList=(
+    ["isFullscreenAppPlayingCheck"]=$((     ACTION_MASK["idle"] | ACTION_MASK["sleep"] | GUI_REQUIRED_MASK  ))
+    ["isInhibitFileExistCheck"]=$((         ACTION_MASK["idle"] | ACTION_MASK["sleep"] | GUI_REQUIRED_MASK  ))
+    ["isMediaPlayerPlayingCheck"]=$((       ACTION_MASK["idle"] | ACTION_MASK["sleep"] | GUI_REQUIRED_MASK  ))
+    ["isAudioPlayingCheck"]=$((                                   ACTION_MASK["sleep"]                      ))
+    ["isDelayProgRunningCheck"]=$((                               ACTION_MASK["sleep"]                      ))
+    ["isCpuLoadHighCheck"]=$((                                    ACTION_MASK["sleep"]                      ))
+    ["isNetworkLoadHighCheck"]=$((                                ACTION_MASK["sleep"]                      ))
+    ["isNetworkConnectionExistsCheck"]=$((                        ACTION_MASK["sleep"]                      ))
+)
+
+# A reason to disable idle/sleep state (such as "audio is playing")
+declare -A disableReason=( ["idle"]="" ["sleep"]="" )
+
+# Is GUI session has launched by some user.
+# Detected during runtime by getGuiVariables().
+guiAvailable=0
+
+# An actual user name who executed lightson.
+# Note: this overrides environment variable set for lightson process.
+# But it helps when running lightson as systemd service, when no environment vars are available at all.
+USER="$( id --user --name )"
+
+# Basename of the optional config file.
+# Script searches config file lightson-ng.conf in the following order:
+# - home dir: $HOME/.config/lightson-ng/
+# - system-wide dir: /etc/
+# - directory where lightson script is located
+# The first config found will be loaded.
+configBase="${lightsOnLogTag}.conf"
+
+# Full path to the config file, determined during runtime.
+configFile=""
+
+# You can find the value for this with `xprop WM_NAME`
+# (click on the window once the mouse is a crosshair)
+windowName=""
+
+# Screensaver detected.
+screenSaver=""
+
+# Power Management states to process.
+# TODOFEATURE: functionality to disable/enable state handling by setting its value to 0/1.
+declare -A powerManagementStateList=( ["idle"]=1 ["sleep"]=1 )
+
+# saved previous state. Used to detect whether state is changed or not.
+declare -A previousStateDisabled=( ["idle"]=0 ["sleep"]=0 )
+
+# Display of the user executing lightson.
+realDispSystem=$( cut -d. -f1 <<< "$DISPLAY" )
+
+# Inhibit file is set externally.
+# While inhibit file exists - system will not sleep.
+inhibitFile="/tmp/${lightsOnLogTag}-inhibit-${UID}-${realDispSystem#:}"
+
+# Flag used to inhibit idle/sleep modes
+#declare -A inhibitorMask=( ["idle"]=4 ["sleep"]=8 )
+
+# PID of inhibitor process.
+declare -A inhibitorPid=( ["idle"]="" ["sleep"]="" )
+
+# User running the inhibitor.
+declare -A inhibitorUser=( ["idle"]="" ["sleep"]="" )
+
+# Type of inhibitor currently in use: gnome or systemd
+declare -A inhibitorType=( ["idle"]="" ["sleep"]="" )
+
+# Signal used to kill inhibitor.
+killSignal="SIGTERM"
+
+# File with PID of lightson process.
+pidFile="/tmp/${lightsOnLogTag}-${UID}-${realDispSystem#:}.pid"
+
+# PID of lightson process.
+lightsOnPid=$$
+
+# Temporary file with variables needed to launch GUI app when running as root.
+guiEnvFile=""
+
+# User to perform inhibitions and GUI-dependant checks.
+# Might change during runtime.
+guiUser="${USER}"
+
+# Settings changed via command line.
+declare -A argumentPassed
+
+# Check state from the previous iteration and, if state did not change - do not process disable/enable functions.
+# 1 - normal behaviour, when inhibitors used.
+# If set to 0 - state handling will be executed for every iteration, adding unnecessary workload.
+# Note: constant state handling is needed when state is disabled by delaying screensaver/simulating user activity.
+#       I.e. delay should be "pushed" every iteration, otherwise, when delay timer ends, state is enabled again,
+#       while lightson does not know about it.
+previousStateDisabledInspect=1
+
+# Reasons to restore state.
+REASON_PID_REMOVE="PID remove"
+REASON_NO_DISABLE_REASON_PROVIDED="No check provided a reason to disable state"
+
+# Runtime indicator whether some process exists and is playing audio.
+processIsPlaying=0
+
+# If signal doLateCheckSignal is received - perform all check, but do not install inhibitors.
+# This is needed for special case: to prevent system suspend in the systemd's chain.
+# Late check systemd's service is added by lateCheckAdd().
+# When sleep.target is reached by the system, then one-time service is asking lightson-ng
+# whether the system can continue suspend, or not.
+# If not, then Late check service will prevent suspension by exiting with non-zero exit code:
+# 1 - at least one check found the reason to disable sleep state
+doLateCheckFlag=0
+
+# Saved DPMS settings
+declare -A savedDpms
+savedDpms['stateSaved']=0
+savedDpms['stateNeedsRestore']=0
+
+# Statistics module section
+# Filename of stats executable.
+statsModuleFile="$( dirname "$0")/lightson-ng-stat.py"
+statsModulePid=""
+
+# Number of errors occurred during lightson-ng runtime.
+runtimeErrors=0
+
+# Statistics will be collected here.
+declare -A stats=(  )
+
+# Stats service location in DBUS.
+LIGHTSON_STATS_CONNECTION_NAME="org.LightsOn.StatService"
+LIGHTSON_STATS_OBJECT="/LightsOnStat"
+LIGHTSON_STATS_INTERFACE="org.LightsOn.StatInterface"
+
+# Use "system" or "session" bus.
+# "system" is default, since late check can run.
+# If lightson can not be executed under root account,
+# then session bus is used, to communicate with lightson-ng-indicator.
+statsBusType="system"
+
+# Indicator for saving stats: value can be empty string, but nevertheless it should be saved to stats.
+ALLOW_EMPTY_VALUE="_value_can_be_empty"
+
+isFullscreenAppPlayingCheck()
+{
+    # get DISPLAY variable from GUI
+    local realDisp; realDisp=$( suGui "echo \\\$DISPLAY" | cut -d. -f1 )
+    [ -z "$realDisp" ] && {
+        logError "no DISPLAY variable is set for GUI user"
+        return 0
+    }
+    
+    # Enumerate all the attached screens
+    displays=""
+    while read -r id; do
+        displays="$displays $id"
+    done< <( suGui "xvinfo" | sed -n 's/^screen #\([0-9]\+\)$/\1/p' )
+
+    # loop through every display looking for a fullscreen window
+    for display in $displays; do
+        # get id of active window and clean output
+        active_win_id=$( suGui "DISPLAY=${realDisp}.${display} xprop -root _NET_ACTIVE_WINDOW" )
+        active_win_id=${active_win_id##*# }
+        active_win_id=${active_win_id:0:9} # eliminate potentially trailing spaces
+        logDebug "active_win_id=$active_win_id"
+
+        top_win_id=$( suGui "DISPLAY=${realDisp}.${display} xprop -root _NET_CLIENT_LIST_STACKING" )
+        top_win_id=${active_win_id##*, }
+        top_win_id=${top_win_id:0:9} # eliminate potentially trailing spaces
+
+        # Check if Active Window (the foremost window) is in fullscreen state
+        if [ ${#active_win_id} -ge 3 ]
+        then
+            isActiveWinFullscreen=$( suGui "DISPLAY=${realDisp}.${display} xprop -id ${active_win_id}" | grep _NET_WM_STATE_FULLSCREEN )
+        else
+            isActiveWinFullscreen=""
+        fi
+        if [ ${#top_win_id} -ge 3 ]
+        then
+            isTopWinFullscreen=$( suGui "DISPLAY=${realDisp}.${display} xprop -id ${top_win_id}" | grep _NET_WM_STATE_FULLSCREEN )
+        else
+            isTopWinFullscreen=""
+        fi
+
+        if [ -n "$windowName" ]
+        then
+            isNamedFullscreen=$( suGui "DISPLAY=${realDisp}.${display} xprop -name \"${windowName}\"" | grep _NET_WM_STATE_FULLSCREEN )
+        else
+            isNamedFullscreen=""
+        fi
+
+        if [[ "$isActiveWinFullscreen" = *NET_WM_STATE_FULLSCREEN* ]] || [[ "$isTopWinFullscreen" = *NET_WM_STATE_FULLSCREEN* ]]
+        then
+            if isAppRunning
+            then
+                stateDisableReason="full screen app is running"
+                return 0
+            fi
+        fi
+
+        logDebug "active_win_id=$active_win_id top_win_id=$top_win_id isActiveWinFullscreen=$isActiveWinFullscreen isTopWinFullscreen=$isTopWinFullscreen"
+
+        # If we are detecting by named application, then we need to detect if any audio is playing.
+        # Detecting by name is used for multiple monitors where the video might be playing, but
+        # not in focus.
+        if [[ "$isNamedFullscreen" = *NET_WM_STATE_FULLSCREEN* ]]
+        then
+            if isAudioPlayingCheck
+            then
+                stateDisableReason="full screen app is playing audio"
+                return 0
+            fi            
+        fi
+    done
+
+    return 1
+}
+
+isProcessPlaying() {
+  # Check if process exists and (optionally) is playing audio. Helper function for isAppRunning().
+  local checkProcess="$1" checkAudio="$2"
+
+  if (( $( pgrep -c "$checkProcess" ) ))
+  then
+      if [ -n "$checkAudio" ]
+      then
+          isAudioPlayingCheck "$checkAudio" && {
+              processIsPlaying=1
+              return 0
+          }
+      else
+          processIsPlaying=1
+          return 0
+      fi
+  fi
+  return 1
+
+}
+
+# TODOFEATURE: Check if active window is mplayer, vlc or firefox
+# Then change IFs to detect more specifically the apps "<vlc>" and if process name exist
+isAppRunning()
+{
+    processIsPlaying=0
+    # Get title of active window
+    active_win_title=$( suGui "xprop -id $active_win_id" | grep "WM_CLASS(STRING)" | sed 's/^.*", //;s/"//g' )
+    logDebug "active_win_title=$active_win_title"
+
+    case "$active_win_title" in
+    *[Cc]hromium*)
+        [ "$detectFsChromiumFlash" = 1 ]  && isProcessPlaying "chromium --type=ppapi"
+        [ "$detectFsHtml5" = 1 ]          && isProcessPlaying "chromium" "chromium";;
+    *[Cc]hrome*)
+        [ "$detectFsChromiumFlash" = 1 ]  && isProcessPlaying "chrome --type=ppapi"
+        [ "$detectFsHtml5" = 1 ]          && isProcessPlaying "chrome" "chrom";;
+    *[Ff]irefox*)
+        [ "$detectFsHtml5" = 1 ]          && isProcessPlaying "firefox" "firefox";;
+    *[Bb]rave*)
+        [ "$detectFsChromiumFlash" = 1 ]  && isProcessPlaying "brave --type=ppapi"
+        [ "$detectFsHtml5" = 1 ]          && isProcessPlaying "brave" "brave";;
+    *opera*)
+        [ "$detectFsHtml5" = 1 ]          && isProcessPlaying "opera" "opera";;
+    *epiphany*)
+        [ "$detectFsHtml5" = 1 ]          && isProcessPlaying "epiphany" "epiphany";;
+    *unknown*|*plugin-container*)
+        [ "$detectFsFirefoxFlash" = 1 ]   && isProcessPlaying "plugin-container";;
+    *WebKitPluginProcess*)
+        [ "$detectFsWebkitFlash" = 1 ]    && isProcessPlaying ".*WebKitPluginProcess.*flashp.*";;
+    *MPlayer|mplayer*)
+        [ "$detectFsMplayer" = 1 ]        && isProcessPlaying "mplayer" "mplayer";;
+    *plexmediaplayer*)
+        [ "$detectFsPlex" = 1 ]           && isProcessPlaying "plexmediaplayer" "Plex Media Player";;
+    *vlc*|*VLC*)
+        [ $detectFsVlc = 1 ]              && isProcessPlaying "vlc" "vlc";;
+    *totem*)
+        [ $detectFsTotem = 1 ]            && isProcessPlaying "totem" "totem";;
+    *steam*)
+        [ $detectFsStream = 1 ]           && isProcessPlaying "steam";;
+    *minitube*)
+        [ $detectFsMiniTube = 1 ]         && isProcessPlaying "minitube";;
+    *)
+        if [ -n "$detectFsChromeAppName" ]
+        then
+            # Check if google chrome is running in app mode
+            [[ "$active_win_title" == *$detectFsChromeAppName* ]] && isProcessPlaying "chrome --app"
+        fi
+        ;;
+    esac
+
+    (( processIsPlaying )) && return 0
+
+    return 1
+}
+
+isAudioPlayingCheck()
+{
+    # Check if any application is playing sounds in pulse.
+    # This is useful if your application keeps the stream in pulse open
+    # but, lists it as CORKED for example.
+    # It's also useful if you watch videos on multiple monitors and might not
+    # have the video in focus.
+    local playingSource="" playingApp="$1"
+
+    # Check Pulse Audio.
+    # Detect if daemon is running.
+    if (( detectPlayingViaPulse )) && suGui "pacmd stat &> /dev/null"
+    then
+        # Check if specific application is playing audio. For isAppRunning() only.
+        if [ -n "$playingApp" ]
+        then
+
+            (( detectFsAudioStreaming )) || return 1
+
+            if suGui "pacmd list-sink-inputs" | grep -Eiq "application.name = .*$playingApp.*"
+            then
+                return 0
+            else
+                return 1
+            fi
+
+        # Check if sink is playing audio via any application. For common audio playing check.
+        else
+            suGui "pacmd list-sink-inputs" | grep -Eiq "RUNNING" && playingSource="pulse"
+        fi
+    fi
+
+    # Check ALSA
+    (( detectPlayingViaAlsa )) && grep -q "RUNNING" < $alsaCardStatus && playingSource="alsa"
+
+    if [ -n "$playingSource" ]
+    then
+        stateDisableReason="audio is playing via $playingSource"
+        logDebug "alsaCardStatus=$alsaCardStatus"
+        return 0
+    else
+        return 1
+    fi
+}
+
+isDelayProgRunningCheck()
+{
+    # Check if specific programs are running
+
+    for prog in "${delayProg[@]}"
+    do
+        if (( $( pgrep -lfc "$prog" ) ))
+        then
+            stateDisableReason="a program from delay list [${prog}] is running"
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+isCpuLoadHighCheck()
+{
+    # Check CPU load. 1 = 100%, 2 = 200% (for multicore CPU),...
+    # Load average for the past 5 minutes is taken.
+    
+    cpuLoad="$( uptime | sed -r 's/.*average: (.*), (.*), (.*).*$/\2/g' | tr ',' '.' )"
+
+    if [ -n "$cpuLoadMax" ]
+    then
+        if (( $( bc <<< "$cpuLoad > $cpuLoadMax" ) ))
+        then
+            stateDisableReason="high CPU load: [${cpuLoad}]"
+            return 0
+        fi
+    else
+        logError "Can not check CPU load"
+    fi
+    
+    return 1
+}
+
+isNetworkLoadHighCheck()
+{   
+    # Check network load
+    # Get utilization of interface, in percents.
+    # First, check the position of needed column, since sar output may vary by its version,
+    # then get utilization using the column number detected.
+
+    for interface in "${interfaceList[@]}"
+    do
+        logDebug "Checking interface $interface"
+
+        ifUsage=$( sar -n DEV --iface="$interface" "$netStatGatherTime" 1 | tail -2 | tr ',' '.' | \
+                    awk '
+                        BEGIN { fno=0 }
+
+                        { for (i = 1; i <= NF; ++i) {
+
+                             if (fno != 0) {
+                                print $fno
+                                exit
+                             }
+
+                             if ($i == "%ifutil" ) { fno=i }
+                          }
+                        }')
+
+        if [ -n "$ifUsage" ]
+        then
+            if (( $( bc <<< "$ifUsage > $ifUsageMax" ) ))
+            then
+                stateDisableReason="high network load: [${ifUsage}] for interface=$interface"
+                return 0
+            fi
+        else
+            logError "Can not check network load."
+        fi
+        
+    done
+    
+    return 1
+}
+
+isNetworkConnectionExistsCheck()
+{
+    # Check of network connections made to this PC.
+    # Connections can be of any protocol and type: NFS/DLNA/SMB...TCP/UDP/...
+    # Using sockets is also OK, but it will be named as "ip" in the log file - a minor drawback.
+    
+    for ip in "${remoteIpList[@]}"
+    do
+        if netstat --all --numeric | grep -q "$ip"
+        then
+            stateDisableReason="network connection is active for ip=$ip"
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+isInhibitFileExistCheck()
+{
+    # Check if inhibit-file (that is set externally) exists.
+
+    if [ -f "$inhibitFile" ]
+    then
+        stateDisableReason="inhibitor-file exists [$inhibitFile]"
+        return 0
+    else
+        return 1
+    fi
+}
+
+isMediaPlayerPlayingCheck()
+{
+    # Check if MPRIS Media Player is playing something.
+    # Can be used to check if Chrome is playing youtube video.
+    # Use of Media Player is not limited to Chrome only, but extends to Totem, Audacious, etc.
+
+    if suGui "bash" <<'EOF2'
+    
+        playerInstance=$( dbus-send --session --dest=org.freedesktop.DBus --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames \
+        | grep "string" | awk '{ print $2; }' | sed -r 's/^"//; s/"$//' | grep org.mpris.MediaPlayer2 )
+    
+        if [ -n "${playerInstance}" ]
+        then
+            dbus-send --print-reply --dest=$playerInstance /org/mpris/MediaPlayer2 org.freedesktop.DBus.Properties.Get string:'org.mpris.MediaPlayer2.Player' string:'PlaybackStatus' | grep -q Playing
+        else
+            exit 1
+        fi
+EOF2
+
+    then
+        stateDisableReason="MPRIS Media Player is playing"
+        return 0
+    else
+        return 1
+    fi
+}
+
+addToCheckList()
+{
+    # Register the new custom check in the list.
+    local checkName="$1" checkFlags="$2"
+
+    [ -n "${checkList[$checkName]}" ] && return 0
+    checkList+=( ["${checkName}"]="${checkFlags}" )
+}
+
+doAllChecks()
+{
+    # Perform all checks to detect whether idle/or sleep mode should be disabled.
+    #
+    # If detected, the check will write the resulting reason in these variables.
+    # Variable is non-empty if the reason  is found by check and empty otherwise.
+    # If reason is not empty after performing all checks, corresponding state (idle or sleep)
+    # will be inhibited (disabled). States are changed by handlePmState().
+    # If reason is empty after performing all checks,
+    # then inhibitor for the given state will be removed.
+    local givenState doCheck varFlag rc
+
+    # Before doing checks: initialize disable reasons with empty string.
+    # Reasons to disable idle/sleep modes are determined by checks doCheck() below.
+    for givenState in "${!powerManagementStateList[@]}"; do disableReason[$givenState]=""; done
+
+    # Go through all the checks from the list.
+    log "Performing checks"
+    for doCheck in "${!checkList[@]}"
+    do
+        logDebug "Preparing to check: $doCheck"
+
+        stateDisableReason=""
+
+        for givenState in "${!powerManagementStateList[@]}"
+        do
+            stats["disableReason_${givenState}_$doCheck"]=""
+        done
+
+        # Some checks need GUI environment to act.
+        (( checkList[$doCheck] & GUI_REQUIRED_MASK )) && (( ! guiAvailable )) && {
+
+            log "No GUI available. $doCheck skipped."
+            continue
+        }
+
+        # Examine corresponding flag to detect shall we execute this check or not.
+        varFlag="${doCheck%Check}"; varFlag="detect${varFlag#is}"
+        ! (( ${!varFlag} )) && {
+            logDebug "The check function $doCheck exists but flag $varFlag is not raised. Skipping this check."
+            continue
+        }
+
+        # shellcheck disable=SC2031
+        logDebug "Executing ${doCheck} as user $guiUser"
+
+        # Execute check.
+        $doCheck
+        rc=$?
+
+        [ $rc -eq 0 ] && {
+
+            # Add some message to the disable reason if it is empty.
+            [ -z "$stateDisableReason" ] && stateDisableReason="$doCheck check worked"
+            log "$stateDisableReason"
+        }
+
+        stats["checkPerformed_${doCheck}"]="$rc"
+
+        # Assign the reason taken from the last check to particular state(s),
+        # depending on action mask from the check list.
+        if [ -n "$stateDisableReason" ]
+        then
+            for givenState in "${!powerManagementStateList[@]}"
+            do
+                (( checkList[$doCheck] & ACTION_MASK[$givenState] )) && {
+
+                    disableReason[$givenState]="$stateDisableReason"
+                    stats["disableReason_${givenState}_$doCheck"]="${disableReason[$givenState]}"
+                }
+
+                logDebug "Reason: checkList[$doCheck] mask=${ACTION_MASK[$givenState]} state=${givenState} disableReason=${disableReason[$givenState]}"
+
+
+            done
+        fi
+
+    done
+}
+
+die() {
+    logError "$@"
+    exit 1
+}
+
+log()
+{
+  (( logStdout )) && echo "$1"
+  (( logSyslog )) && logger --id=$lightsOnPid --tag $lightsOnLogTag "$1"
+}
+
+logError()
+{
+  echo "ERROR: $1" >&2
+  (( logSyslog )) && logger --id=$lightsOnPid --tag $lightsOnLogTag "ERROR: $1"
+  (( runtimeErrors++ ))
+}
+
+logDebug()
+{
+  (( debugMode )) && log "Debug: $1" >&2
+}
+
+pidCreate() {
+    # Create lock file.
+    # Just one instance can run simultaneously.
+
+    if [ ! -e "$pidFile" ]
+    then
+        echo "$lightsOnPid" > "$pidFile"
+    else
+        if [ -d "/proc/$(cat "$pidFile")" ]
+        then
+            die "Another instance is running, abort!"
+        fi
+
+        echo "$lightsOnPid" > "$pidFile"
+    fi
+}
+
+pidRemove()
+{
+    # Remove lock file.
+    local rc="$1"; rc=${rc:-0}
+
+    # Restore the original Power Management settings.
+    for state in "${!powerManagementStateList[@]}"
+    do
+        enableState "$state" "$REASON_PID_REMOVE"
+    done
+
+    # Remove late check service from systemd
+    lateCheckRemove
+
+    # Remove stats module
+    [ -n "$statsModulePid" ] && kill -${killSignal} "$statsModulePid"
+    
+    # Remove temporary file with GUI variables.
+    rm -f "$guiEnvFile" || logError "Can not remove guiEnvFile: $guiEnvFile"
+            
+    # Remove lock file
+    if [ ! -e "$pidFile" ]
+    then
+        logError "Missing pidFile"
+    elif [ ! -f "$pidFile" ]
+    then
+        logError "[${pidFile}] is not a file\n"
+    else
+        if [ "$(cat "$pidFile")" != "$lightsOnPid" ]
+        then
+            die "Wrong lockfile [$pidFile], abort!"
+        else
+            # Normal exit
+            rm -f "$pidFile" || logError "Can not remove lockfile: $pidFile"
+            log "Lockfile removed. Program finished."
+        fi
+    fi
+
+    # Exit with code provided by checks.
+    exit "$rc"
+}
+
+findConfigFile()
+{
+    # Search config file in home dir, then in /etc, then in the directory where lightson script is located.
+    local homeDir=~
+    
+    [ -z "$homeDir" ] && logError "HOME environment variable is not set."
+    logDebug "homeDir=$homeDir"
+    
+    if tryConfig="${homeDir}/.config/lightson-ng/$configBase";                                           [ -r "$tryConfig" ] \
+       || tryConfig="/etc/$configBase";                                                                  [ -r "$tryConfig" ] \
+       || tryConfig="$( readlink -f "${0}" )"; tryConfig="$( dirname "$tryConfig" )/${configBase}";      [ -r "$tryConfig" ]
+    then
+        configFile="$tryConfig"
+    fi
+}
+
+displayHelp()
+{
+    echo "********************************************************************************************"
+    echo "Usage:    $(basename "$0") [options]"
+    echo ""
+    echo "Options:"
+    echo "  -d,  --delay <time in minutes>      Time interval between checks. Default: 1 min"
+    echo "  -c,  --config-file <filename>       Use configuration from file"
+    echo "  -q,  --quiet                        Do not print messages on screen, but to log file only"
+    echo "  -v,  --verbose                      Print messages on screen"
+    echo "  -g   --no-syslog                    Do not print messages to syslog"
+    echo "  -s   --syslog                       Print messages to syslog"
+    echo "  -b   --debug-on                     Print debug messages"
+    echo "  -n   --debug-off                    Do not print debug messages"
+    echo "       --chrome-app <app name>        Fullscreen Chrome app detection"
+    echo "       --window-name <window name>    Detect fullscreen app by window name"
+    echo "       --restore-pm-settings          Restore default Power Management settings for this PC."
+    echo "  -h,  --help                         Print this help and exit"
+    echo "********************************************************************************************"
+}
+
+parseCommandLine()
+{
+    # Parse command line arguments.
+    local parsedArguments shortOptions="hc:qvd:bngs"
+    local longOptions="delay:,config-file:,quiet,verbose,no-syslog,syslog,debug-on,debug-off,help,restore-pm-settings,chrome-app:,window-name:,check-n-exit"
+    local usageErrorMessage="Usage error (use -h for help)"
+
+    # Check if getopt can process long options.    
+    getopt --test 2> /dev/null
+    { if [ $? -ne 4 ]
+        then
+            logError "GNU's enhanced getopt (from util-linux package) is required to run this script with all its features"
+            parsedArguments=$( getopt $shortOptions "$@" )
+        else
+            parsedArguments=$( getopt --options "$shortOptions" --longoptions "$longOptions" --name "$0" -- "$@" )
+        fi
+    } || die "$usageErrorMessage"
+
+    # Process arguments
+    eval set -- "$parsedArguments"
+
+    while [ $# -gt 0 ]
+    do
+        case "$1" in
+            -h | --help)            displayHelp
+                                    exit 0;;
+            -c | --config-file)     configFile="$2"
+                                    argumentPassed["configFile"]=1
+                                    shift 2;;
+            -q | --quiet)           logStdout=0
+                                    argumentPassed["logStdout"]="$logStdout"
+                                    shift;;
+            -v | --verbose)         logStdout=1
+                                    argumentPassed["logStdout"]="$logStdout"
+                                    shift;;
+            -d | --delay)           [[ "$2" = *[^0-9]* ]] && die "Invalid argument. Time in minutes expected after [$1] flag. Got [$2]"
+                                    loopDelay="$2"
+                                    argumentPassed["loopDelay"]="$loopDelay"
+                                    shift 2;;
+            -b | --debug-on)        debugMode=1
+                                    argumentPassed["debugMode"]="$debugMode"
+                                    shift;;
+            -n | --debug-off)       debugMode=0
+                                    argumentPassed["debugMode"]="$debugMode"
+                                    shift;;
+            -g | --no-syslog)       logSyslog=0
+                                    argumentPassed["logSyslog"]="$logSyslog"
+                                    shift;;
+            -s | --syslog)          logSyslog=1
+                                    argumentPassed["logSyslog"]="$logSyslog"
+                                    shift;;
+            --chrome-app)           detectFsChromeAppName="$2"
+                                    argumentPassed["detectFsChromeAppName"]="$detectFsChromeAppName"
+                                    shift;;
+            --window-name)          windowName="$2"
+                                    argumentPassed["windowName"]="$windowName"
+                                    shift 2;;
+            --restore-pm-settings)  restoreDefaultPmSettingsInGdm=1
+                                    argumentPassed["restoreDefaultPmSettingsInGdm"]="$restoreDefaultPmSettingsInGdm"
+                                    shift;;
+            --)                     shift; break;; # end of options
+        esac
+    done
+    
+    # Only listed options are allowed
+    [ $# -gt 0 ] && {
+        for arg in "$@"; do logError "Unrecognized argument: $arg"; done
+        die "$usageErrorMessage"
+    }
+
+    return 0
+}
+
+detectScreensaver()
+{
+	# Detect screensaver being used.
+	if [ "$( pgrep -c 'gsd-screensaver' )" -ge 1 ]; then
+	
+	  # Ubuntu's 20.04 new gnome 3 screensaver: gsd-screensaver.
+	  # Note: gsd-power process is actually responsible for sleep mode.
+	  screenSaver="gnome3"
+	  
+	# This call of dbus-send produces core dump, therefore commented.
+	# FIXME: find how to avoid core dumps when no dbus-service exists.
+#	elif [ $(suGui "dbus-send --session --print-reply=literal --type=method_call --dest=org.freedesktop.ScreenSaver /ScreenSaver/ org.freedesktop.ScreenSaver.GetActive" &> /dev/null; echo $? ) -eq 0 ]; then
+#	    screenSaver="freedesktop-screensaver"
+
+    # Note: this code was commented in the original lightson++.
+	#elif [ $( pgrep -c gnome-shell ) -ge 1 ] ;then
+	#    screenSaver="xdofallback"
+	
+	elif [ "$( pgrep -c 'xscreensaver' )" -ge 1 ]; then
+	    screenSaver="xscreensaver"
+	elif [ "$( pgrep -c 'mate-screensaver' )" -ge 1 ]; then
+	    screenSaver="mate-screensaver"
+	elif [ "$( pgrep -c 'xautolock' )" -ge 1 ]; then
+	    screenSaver="xautolock"
+	elif [ -e "/usr/bin/xdotool" ]; then
+	    screenSaver="xdofallback"
+	else
+	    screenSaver=""
+	fi
+	
+	logDebug "screensaver detected: $screenSaver"
+}
+
+getIdleCounter()
+{
+    # Get the current value of Gnome's idle counter.
+    # Helper for dynamic loop timer.
+    # Divide the result by 1000 to get value in seconds.
+    # TODOFEATURE: find such counter when no GUI is available to prevent sleep (only). Perhaps, another method is to monitor signal PrepareForSleep=true from logind:
+    #       dbus-monitor --system "type='signal',sender='org.freedesktop.login1',interface='org.freedesktop.login1.Manager'"
+    #       Another finding:
+    #       gdbus introspect --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1/user/_125 --only-properties \
+    #       | grep readonly | grep 'IdleHint\|IdleSinceHint\|IdleSinceHintMonotonic'
+    #       Another finding: monitor for signal on Idle:
+    #       dbus-monitor --session "type=signal,interface=org.gnome.SessionManager.Presence,member=StatusChanged"
+
+    echo $(( $( suGui "dbus-send --session --dest=org.gnome.Mutter.IdleMonitor --print-reply /org/gnome/Mutter/IdleMonitor/Core org.gnome.Mutter.IdleMonitor.GetIdletime" \
+          | sed -rn 's/\s*uint64\s*([[:alnum:]])/\1/p' ) / 1000 ))
+
+    return $?
+}
+
+simulateUserActivity()
+{
+    # Simulate user activity by xdotool to reset the idle counter.
+    # Move the mouse to the corner and then back to the original position.
+    # Tried calling gnome's, free-desktop's SimulateUserActivity and ResetIdleTime without success: methods are not implemented yet.
+    #    dbus-send  --session --dest=org.gnome.Mutter.IdleMonitor --print-reply /org/gnome/Mutter/IdleMonitor/Core org.gnome.Mutter.IdleMonitor.ResetIdletime
+    #    throwing error: org.freedesktop.DBus.Error.UnknownMethod: This method is for testing purposes only. MUTTER_DEBUG_RESET_IDLETIME must be set to use it
+
+    # So, using not nice (because actions are actually performed on behalf of user) but working solution.
+    suGui "xdotool mousemove 0 0 mousemove restore"
+    return $?
+}
+
+saveDpms()
+{
+    # Save the original DPMS state.
+    local dpmsState
+
+    if (( savedDpms['stateSaved'] ))
+    then
+        return 0
+    else
+        logDebug "Saving DPMS settings"
+        dpmsState=$( suGui "xset -q" ) || return 1
+
+        savedDpms['blanking']=$(    sed -rn 's/.*blanking:\s+([[:alnum:]]*)\s+.*/\1/p'  <<< "$dpmsState" )  # xset s blank/noblank
+        savedDpms['exposures']=$(   sed -rn 's/.*exposures:\s+([[:alnum:]]*).*/\1/p'    <<< "$dpmsState" )
+        savedDpms['timeout']=$(     sed -rn 's/.*timeout:\s+([[:alnum:]]*)\s+.*/\1/p'   <<< "$dpmsState" )  # xset s on/off <length> <period>
+        savedDpms['cycle']=$(       sed -rn 's/.*cycle:\s+([[:alnum:]]*).*/\1/p'        <<< "$dpmsState" )  # xset s on/off <length> <period>
+        savedDpms['state']=$(       sed -rn 's/.*DPMS is\s+([[:alnum:]]*).*/\1/p'       <<< "$dpmsState" )  # xset dpms/-dpms
+        savedDpms['stateSaved']=1
+    fi
+}
+
+restoreDpms()
+{
+    # Restore the original DPMS state.
+
+    (( ! savedDpms['stateSaved'] )) && {
+        logDebug "No saved DPMS state. Nothing to restore."
+        return 0
+    }
+
+    if (( savedDpms["stateNeedsRestore"] ))
+    then
+        logDebug "Restoring DPMS settings"
+
+        { if [ "${savedDpms['blanking']}" = "yes" ]
+        then
+            suGui "xset s blank"
+        else
+            suGui "xset s noblank"
+        fi } || return 1
+
+
+        { if (( savedDpms['timeout'] != 0 )) || (( savedDpms['cycle'] != 0 ))
+        then
+            suGui "xset s ${savedDpms['timeout']} ${savedDpms['cycle']}"
+        else
+            suGui "xset s 0 0"
+        fi } || return 1
+
+        { if [ "${savedDpms['state']}" = "Enabled" ]
+        then
+            suGui "xset dpms"
+        else
+            suGui "xset -dpms"
+        fi } || return 1
+
+        savedDpms['stateNeedsRestore']=0
+    fi
+}
+
+delayDpms()
+{
+    # Delay DPMS for a while. Helper for delayScreensaver()
+    (( forceDelayDpms )) && {
+        suGui "xset -q | grep -cq 'DPMS is Enabled' && xset -dpms && xset dpms" || return 1
+    }
+}
+
+disableDpms()
+{
+    # Disable DPMS and (its?) screensaver to prevent screen turnoff
+
+    # Save the original DPMS settings, then disable DPMS.
+    saveDpms || return 1
+
+    logDebug "Disabling DPMS"
+    suGui "xset -dpms && xset s off" || return 1
+
+    savedDpms['stateNeedsRestore']=1
+}
+
+delayScreensaver()
+{
+    log "Delaying screensaver"
+
+    # Reset inactivity time counter so screensaver is not started
+    
+    # FIXME: screen blanking occurs anyway, at least under gnome3 (bug in gnome?).
+    # TODO: do tests due to change to xdotool to simulate user activity.
+    #   Possibly, blanking can be avoided by playing with the following settings:
+    #       gsettings get org.gnome.desktop.session idle-delay
+    #       gsettings get org.gnome.desktop.screensaver idle-activation-enabled
+    #       gsettings get org.gnome.settings-daemon.plugins.power idle-dim
+    
+    if case $screenSaver in
+        "xscreensaver" )
+            suGui "xscreensaver-command -deactivate > /dev/null";;
+        "mate-screensaver" )
+            suGui "mate-screensaver-command --poke > /dev/null";;
+        "xautolock" )
+            suGui "xautolock -disable; xautolock -enable";;
+        "xdofallback" )
+            suGui "xdotool key shift";;
+        "freedesktop-screensaver" )
+            # This call returns Error org.freedesktop.DBus.Error.NotSupported: This method is not implemented. No sense to use it, it does not work.
+            #suGui "dbus-send --session --reply-timeout=2000 --type=method_call --dest=org.freedesktop.ScreenSaver /ScreenSaver org.freedesktop.ScreenSaver.SimulateUserActivity";;
+            simulateUserActivity;;
+        "gnome3" )
+            # This call returns Error org.freedesktop.DBus.Error.UnknownMethod: No such method “SimulateUserActivity”. No sense to use it, it does not work.
+            #suGui "dbus-send --session --reply-timeout=2000 --dest=org.gnome.ScreenSaver --type=method_call /org/gnome/ScreenSaver org.gnome.ScreenSaver.SimulateUserActivity";;
+            # Changed to xdotool.
+            simulateUserActivity;;
+      esac
+    then
+        # Check if DPMS is on. If it is on, deactivate it and reactivate it again to initialize DPMS timer.
+        delayDpms
+        return 0
+    else
+        logError "Can not delay screensaver: $screenSaver"
+        return 1
+    fi
+}
+
+gSettings()
+{
+    # Execute gsettings command considering if GUI is available.
+    # If running as root right after boot, when no users logged into GUI,
+    # then GUI is not available. In this case changes are done in the
+    # system-wide Power Management dbus of "gdm" user.
+    # Therefore non-gui mode requires username that holds dbus database
+    # and dbus-launch to find the path to the database.
+    #
+    # If GUI is available, then changes are done in schema of GUI user.
+
+    local cmd="gsettings $1" result=""
+    
+    if (( guiAvailable ))
+    then
+        result=$( suGui "$cmd" )
+    else
+        result=$( sudo --user "$gdmUser" bash -c "dbus-launch $cmd" )
+    fi
+      
+    local rc=$?
+    [ $rc -ne 0 ] && logError "can not execute gSettings [$cmd]"
+    
+    logDebug "gSettings cmd=[$cmd] result=[$result]"
+    
+    # Show the result. Suppress empty lines.
+    [ -n "$result" ] && echo "$result"
+    
+    return $rc
+}
+
+readGnomeVariable()
+{
+    # Read variable from gsettings
+    gVar="$1 $2"
+    
+    value="$( gSettings "get $gVar" )" || {
+        logError "gSettings can not read variable [$gVar]"
+        return 1
+    }
+
+    # strip type from the value.
+    echo "${value#uint32 }"
+}
+
+writeGnomeVariable()
+{
+    # Write variable to gsettings. $1 - varPath, $2 - varName, $3 - varValue
+    local gVar="$1 $2 $3"
+
+    gSettings "set $gVar" || {
+        logError "gSettings can not write variable [$gVar]"
+        return 1
+    }
+}
+
+restorePmSettings()
+{
+    (( ! restoreDefaultPmSettingsInGdm )) && return 0
+    
+    # Restore default Power Management settings into GDM schema.
+    local gVarAcType gVarAcTimeout gVarBatteryType gVarBatteryTimeout
+    
+    # Unset guiAvailable temporarily to make changes in GDM schema instead of current GUI user's schema.
+    # Next iteration this variable will be set again by getGuiVariables().
+    (( guiAvailable )) && guiAvailable=0
+    
+    log "Recovering system Power Management settings in GDM schema."
+        
+    # First, read all variables we suppose to change, check accessibility of schema.
+    {   gVarAcType=$(           readGnomeVariable "$gPathPower" "sleep-inactive-ac-type"            ) &&
+        gVarAcTimeout=$(        readGnomeVariable "$gPathPower" "sleep-inactive-ac-timeout"         ) &&
+        gVarBatteryType=$(      readGnomeVariable "$gPathPower" "sleep-inactive-battery-type"       ) &&
+        gVarBatteryTimeout=$(   readGnomeVariable "$gPathPower" "sleep-inactive-battery-timeout"    )
+    } || { logError "Can not read gSettings variable $gPathPower sleep-inactive-ac-type and other..."; return 1; }
+
+    # Write PM settings.
+    {   writeGnomeVariable "$gPathPower" "sleep-inactive-ac-type"           "$gdmSleepInactiveAcType"               &&
+        writeGnomeVariable "$gPathPower" "sleep-inactive-ac-timeout"        "$gdmSleepInactiveAcTimeout"            &&
+        writeGnomeVariable "$gPathPower" "sleep-inactive-battery-type"      "$gdmSleepInactiveBatteryType"          &&
+        writeGnomeVariable "$gPathPower" "sleep-inactive-battery-timeout"   "$gdmSleepInactiveBatteryTimeout"
+    } || { logError "Can not write gSettings variable $gPathPower sleep-inactive-ac-type and other..."; return 1; }
+
+    logDebug "gVarAcType=$gVarAcType gVarAcTimeout=$gVarAcTimeout gVarBatteryType=$gVarBatteryType gVarBatteryTimeout=$gVarBatteryTimeout"
+    return 0
+}
+
+getGuiVariables()
+{
+    # GUI variables are only needed when run as root, without GUI.
+    # GUI session has all vars already defined.
+    # This function is needed by gnomeInhibitorAdd()
+    
+    # Detect the active GUI session.
+    # If there are more than one active session on PC (which cannot happen)
+    # then the last row is taken.
+    local envPid=""
+    
+    for sid in $( loginctl --no-legend list-sessions | awk '{ print $1; }' )
+    do
+        if [ "$( loginctl --property Type --value show-session "$sid" )" = "x11" ] \
+        && [ "$( loginctl --property Active --value show-session "$sid" )" = "yes" ] \
+        && [ "$( loginctl --property Name --value show-session "$sid" )" != "$gdmUser" ]
+        then
+            # In Gnome3, a leader is gdm-session-worker, but we need its child: gdm-x-session
+            # and then its child gnome-session-binary
+            # since only there DBUS_* and DISPLAY variables become defined.
+            
+            gdmWorkerPid=$( loginctl --property Leader --value show-session "$sid" )
+            gdmSessionPid=$( ps --ppid "$gdmWorkerPid" -o pid= | tr -d ' ' | tail -1 )
+            envPid=$( pgrep --parent "$gdmSessionPid" "gnome-session-b" | tail -1 | awk '{ print $1; }' )
+            guiUser=$( loginctl --property Name --value show-session "$sid" )
+            
+            logDebug "GUI gdmWorkerPid=$gdmWorkerPid gdmSessionPid=$gdmSessionPid envPid=$envPid guiUser=$guiUser"
+        fi
+    done
+        
+    if [ -n "$envPid" ]
+    then
+        # Collect variables from GUI session.
+        local procEnv="/proc/$envPid/environ"
+
+        if tr '\0' '\n' > "$guiEnvFile" < "$procEnv"
+        then
+            logDebug "GUI environment variables collected to $guiEnvFile"
+        else
+            logError "Error creating file with GUI environment variables: $guiEnvFile from $procEnv"
+        fi
+
+    else
+        logDebug "no GUI session found"
+        guiAvailable=0
+        return 1
+    fi
+    
+    logDebug "GUI session found"
+    guiAvailable=1
+    return 0
+}
+
+suGui()
+{
+    # Run command in GUI environment.
+    # Environment variables are collected by getGuiVariables().
+    # If GUI user is not set then command executed as the current user (root), without GUI environment variables.
+    local cmd="$1" suCmd=""
+    
+    if [ -n "$guiUser" ]
+    then
+        suCmd="sudo --user ${guiUser} bash -c \"set -a; source $guiEnvFile; $cmd\""
+    else
+        suCmd="sudo --user ${USER} bash -c \"$cmd\""
+    fi
+
+    logDebug "suGui: $suCmd"
+
+    eval "$suCmd"
+
+    return $?
+}
+
+inhibitorAdd()
+{
+    # Add inhibitor of given state using either Gnome's Session Manager or Systemd.
+    local type="$1" state="$2"
+
+    inhibitorType[$state]="$type"
+
+    logDebug "Adding $state inhibitor of type $type as user $guiUser"
+
+    if [ "$type" = "gnome" ]
+    then
+        # Note: session-inhibit uses "suspend" term in place of "sleep".
+        #( suGui "gnome-session-inhibit --inhibit \"${state/sleep/suspend}\" --reason \"$lightsOnLogTag\" --app-id \"$lightsOnLogTag\" sleep infinity &> /dev/null" ) &
+        ( suGui "gnome-session-inhibit --inhibit \"${state/sleep/suspend}\" --reason \"$lightsOnLogTag\" --app-id \"$lightsOnLogTag\" sleep infinity" ) &
+
+        inhibitorPid[$state]=$!
+
+        # Check if process is alive
+        # and choose its child process "sleep infinite" instead of inhibitor itself to kill later: inhibitor->child1->child2->child3->[child4]
+        sleep $waitDelay
+        inhibitorPid[$state]="$( ps --ppid "$( ps --ppid "$( ps --ppid "$( ps --ppid "${inhibitorPid[$state]}" -o pid= | tr -d ' ' )" -o pid= | tr -d ' ' )" -o pid= |
+                            tr -d ' ' )" -o pid= | tr -d ' ' )"
+
+        inhibitorUser[$state]="$guiUser"
+
+    elif [ "$type" = "systemd" ]
+    then
+        #( suGui "systemd-inhibit --what=\"$state\" --who=\"$lightsOnLogTag\" --why=\"$lightsOnLogTag\" --no-pager --no-legend sleep infinity &> /dev/null" ) &
+        # systemd-inhibit should run as root to have permissions. If run as regular user in login shell - systemd-inhibit will work,
+        # but if run from systemd service - PolKit permissions should be added. So, just simply run as root:
+        ( systemd-inhibit --what="$state" --who="$lightsOnLogTag" --why="$lightsOnLogTag" --no-pager --no-legend sleep infinity ) &
+
+        inhibitorPid[$state]=$!
+        sleep $waitDelay
+        inhibitorPid[$state]="$( ps --ppid "${inhibitorPid[$state]}" -o pid= | tr -d ' ' )"
+        inhibitorUser[$state]="$USER"
+
+    else
+        logError "Unknown inhibitor type specified: $type"
+        return 1
+    fi
+
+    [ -z "${inhibitorPid[$state]}" ] && return 1
+
+    log "$state inhibitor [${inhibitorPid[$state]}] of type $type is added"
+    return 0
+}
+
+disableState()
+{
+    # Disable either idle or sleep state.
+    # Run gnome's inhibitor for Gnome session, or systemd-inhibit for non-GUI session.
+    local state="$1" lDisableReason="$2" rc=1
+    
+    # Do nothing if state is already disabled in previous iteration.
+    (( previousStateDisabledInspect )) && (( previousStateDisabled[$state] )) && {
+        logDebug "State $state is already disabled"
+
+        (( guiAvailable )) && [ "$state" = "idle" ] && delayDpms
+
+        return 0
+    }
+
+    # User can overwrite disabling state function by putting disableStateCustom() in config file.
+    (( forceHandleStateCustom )) && {
+    
+        disableStateCustom "$state"
+        
+        rc=$?
+        (( ! continueWithHandleStateStandard )) && return $rc
+    }
+    
+    # Note: only the last detected disable reason is shown in the log.
+    log "Disabling $state state because ${lDisableReason[$state]}"
+    
+    if (( ! guiAvailable )) && [ "$state" = "idle" ]
+    then
+        logError "Can not disable idle state for reason [${lDisableReason[$state]}] in non-GUI mode"
+        return 1
+    fi
+
+    # If forceDelayScreensaver is set by user, then just delay the screensaver instead of setting inhibitor.
+    if (( forceDelayScreensaver ))
+    then
+        if (( guiAvailable ))
+        then
+            delayScreensaver
+            return $?
+        else
+            logError "Can not delay the screensaver when GUI is unavailable. Set forceDelayScreensaver=0 to use inhibitors instead"
+            return 1
+        fi
+    fi
+
+    # Now, do the main job.
+    # Add inhibitor if one is not running yet.
+    if [ -z "${inhibitorPid[$state]}" ]
+    then
+        if (( guiAvailable )) && (( ! forceSkipGnomeInhibitor ))
+        then
+            # Try to add gnome's inhibitor, fallback to systemd inhibitor.
+            inhibitorAdd "gnome" "$state"
+
+            rc=$?
+            [ $rc -ne 0 ] && {
+                log "Fallback to systemd inhibitor"
+                inhibitorAdd "systemd" "$state"
+                rc=$?
+            }
+            
+        else
+            inhibitorAdd "systemd" "$state"
+            rc=$?
+        fi
+        
+        logDebug "inhibitor result: rc=$rc state=$state pid=${inhibitorPid[$state]} type=${inhibitorType[$state]} user=${inhibitorUser[$state]}"
+        [ $rc -ne 0 ] && return 1
+
+    else
+        log "$state inhibitor [${inhibitorPid[$state]}] is already running - good"
+    fi
+
+    # Disable DPMS as well to avoid screen blanking.
+    # Because gnome's inhibitor does not switch off DPMS.
+    (( guiAvailable )) && [ "$state" = "idle" ] && disableDpms
+    
+    return 0
+}
+
+enableState()
+{
+    # Remove inhibitor of given state.
+    local state="$1" lRestoreReason="$2" rc=1
+    
+    # Do nothing if state is already disabled in previous iteration.
+    (( previousStateDisabledInspect )) && (( ! previousStateDisabled[$state] )) && {
+        logDebug "State $state is already enabled"
+        return 0
+    }
+    
+    # User can overwrite enabling state function by putting enableStateCustom() in config file.
+    (( forceHandleStateCustom )) && {
+    
+        enableStateCustom "$state" "$lRestoreReason"
+        
+        rc=$?
+        (( ! continueWithHandleStateStandard )) && return $rc
+    }
+    
+    log "Enabling $state state because $lRestoreReason"
+    
+    # Remove inhibitor process.
+    if [ -n "${inhibitorPid[$state]}" ]
+    then
+
+        if ps --pid "${inhibitorPid[$state]}" >/dev/null
+        then
+            logDebug "removing inhibitor inhibitorPid=${inhibitorPid[$state]} of type=${inhibitorType[$state]} user=${inhibitorUser[$state]}"
+
+            # Inhibitor should be killed under the user who launched inhibitor.
+            # Note: current guiUser might change since inhibitor's added.
+            # That's why username is saved when inhibitor is added, in *InhibitorAdd() functions.
+            # Here username is restored.
+            # SIGTERM signal is sent to the inhibitor's process which should handle this signal silently.
+            # TODO: debug with systemd-inhibit set. ps chain may vary.
+
+            # FIXME: kill systemd inhibitor as root user, not as guiUser
+            # shellcheck disable=SC2030
+            ( guiUser="${inhibitorUser[$state]}"
+              suGui "kill -${killSignal} ${inhibitorPid[$state]}"
+            ) &> /dev/null
+   
+            # Check that process was really died
+            sleep $waitDelay
+            
+            if ps --pid "${inhibitorPid[$state]}" >/dev/null
+            then
+                logError "can not kill inhibitor [${inhibitorPid[$state]}] for $state"
+                return 1
+            else
+                log "$state inhibitor [${inhibitorPid[$state]}] removed - good"
+            fi
+            
+        else
+            [ ! "$lRestoreReason" = "$REASON_PID_REMOVE" ] && logError "$state inhibitor [${inhibitorPid[$state]}] already removed"
+        fi
+
+    fi
+    
+    # Cleanup inhibitor's PID, type and user
+    inhibitorPid[$state]=""
+    inhibitorType[$state]=""
+    inhibitorUser[$state]=""
+
+    # Restore DPMS settings
+    (( guiAvailable )) && [ "$state" = "idle" ] && restoreDpms
+    
+    return 0
+}
+
+handlePmState()
+{
+    # If there is a reason to disable Power Management state,
+    # either Sleep or Idle, then do it.
+    # If doLateCheckFlag specified - do not add/remove inhibitors.
+    local state reasonFound=0
+    logDebug "disable_reason_sleep: ${disableReason['sleep']}, inhibitorPid=${inhibitorPid['sleep']}, previousStateDisabled=${previousStateDisabled['sleep']}"
+    
+    for state in "${!powerManagementStateList[@]}"
+    do
+        if [ -n "${disableReason[$state]}" ]
+        then
+            if (( doLateCheckFlag ))
+            then
+                dbusStatsCmd "DisableReasonFound" "${state}"
+            else
+                disableState "$state" "${disableReason[$state]}" || return 1
+                previousStateDisabled[$state]=1
+            fi
+            
+            reasonFound=1
+
+        else
+            if (( doLateCheckFlag ))
+            then
+                dbusStatsCmd "EnableReasonFound" "${state}"
+            else
+                enableState "$state" "$REASON_NO_DISABLE_REASON_PROVIDED" || return 1
+                previousStateDisabled[$state]=0
+            fi
+        fi
+    done
+    
+    if (( reasonFound ))
+    then
+        # If option specified to perform late check.
+        (( doLateCheckFlag )) && dbusStatsCmd "AnyReasonFound"
+    else
+        (( doLateCheckFlag )) && dbusStatsCmd "ReasonNotFound"
+        log "Lights off..."
+    fi
+     
+    return 0
+}
+
+calculateLoopDelay()
+{
+    # Calculate the loop delay - time to wait between check/inhibit iterations.
+    # Note: if delay is big, then there is a chance that PC will go into sleep state even if there are reasons to prevent the sleep state.
+    # Example: the reason occurs during loop delay and PC goes to sleep during this loop delay. Nothing will prevent the sleep state,
+    # since checks do not run during loop delay.
+    local idleDelay sleepTimeout newDelay idleCounter
+    declare -il BASH_MAX_INT=2147483647
+
+    # Calculate dynamic loop delay, if possible.
+    # Dynamic loop delay is 10 seconds less than the time it takes to activate your
+    # screensaver or Power Management. Checks are done every X seconds.
+    # Where X is calculated based on your system sleep time, with a minimum of $loopDelay.
+    if (( dynamicLoopDelay ))
+    then
+        logDebug "Calculating dynamic loop delay."
+        # Take configured delay for idle mode.
+        idleDelay=$(        readGnomeVariable "$gPathSession"   "idle-delay" )                      || idleDelay=$BASH_MAX_INT
+
+        # Take configured delay for sleep mode.
+        if upower --dump | grep -q "[[:blank:]]*on-battery:[[:blank:]]*no[[:blank:]]*"
+        then
+            sleepTimeout=$( readGnomeVariable "$gPathPower"     "sleep-inactive-ac-timeout" )       || sleepTimeout=$BASH_MAX_INT
+        else
+            sleepTimeout=$( readGnomeVariable "$gPathPower"     "sleep-inactive-battery-timeout" )  || sleepTimeout=$BASH_MAX_INT
+        fi
+
+        # Get the minimum value from the delays configured in the system.
+        # The loop delay should not exceed neither sleep nor idle time.
+        if (( idleDelay < sleepTimeout ))
+        then
+            newDelay="$idleDelay"
+        else
+            newDelay="$sleepTimeout"
+        fi
+
+        # Check if system has returned a reasonable value.
+        if [ -z "$newDelay" ] || (( newDelay == BASH_MAX_INT ))
+        then
+            logError "Can not use dynamic loop delay: $newDelay"
+        else
+            loopDelay="$newDelay"
+            logDebug "Dynamic loop delay is: $loopDelay seconds"
+        fi
+
+        # Adjust the delay with an idle timer.
+        # A new iteration should start before the idle counter reaches an idle/sleep timeout configured.
+        # If an idle counter is already greater than the delay, then leave delay as is (set above to the lowest value of idle/sleep timeouts).
+        # Also subtract the min delay and spare time, which are low, but can have an influence.
+        if (( guiAvailable ))
+        then
+            idleCounter=$( getIdleCounter )
+            logDebug "Idle counter=$idleCounter"
+
+            if [ -n "$idleCounter" ]
+            then
+                (( (( loopDelay - loopSpareTime - loopMinDelay )) > idleCounter )) && loopDelay=$(( loopDelay - idleCounter ))
+            else
+                # OPTIMIZE: It is not good that the idle counter is not available while GUI is available.
+                logDebug "Can not get the value from idle timer."
+            fi
+        else
+            logDebug "Idle counter without GUI is not implemented."
+        fi
+    fi
+
+    # Check if delay is not too small. We subtract a little $loopSpareTime seconds for assurance.
+    # Notice if calculation of dynamic delay failed, we use a delay configured statically.
+    loopDelay=$(( loopDelay - loopSpareTime ))
+    if (( loopDelay < loopMinDelay ))
+    then
+        log "Loop delay: $loopDelay is lower than the minimal delay allowed: $loopMinDelay, considering spare time: $loopSpareTime."
+        loopDelay="$loopMinDelay"
+        log "Setting the minimal loop delay: $loopDelay"
+    else
+        log "Loop delay is set to $loopDelay seconds"
+    fi
+}
+
+lateCheckAdd()
+{
+    # Add the unit to systemd that prevents sleep mode if sleep.target reached.
+    # This is workaround.
+    # Chances to miss the sleep.target are low, since the main loop of lightson is working fine with dynamic loop adjustments, but still they are:
+    # some fullscreen app may start during the timeframe between main loop's checks finished and PM's sleep timeout reached.
+    # This timeframe is not covered by checks - lightson is sleeping at this time.
+    #
+    # In the late service a separate lightson process is executed.
+    # Lightson makes checks and exits with non-zero code if some checks returned true. Non-zero code causes systemd to break further sleep->suspend chain.
+    # If all checks returned false, then lightson exists with 0 code. This allows systemd to continue a sleep chain and suspend the PC.
+    # Note: this service is runtime, so after reboot this service disappears (unless lightson itself installs it again). Also, lightson removes this service on exit,
+    # so, systemd's service chain is returned to its original state.
+    local systemdResponse systemdService lateCheckCommand
+
+    # Note: the syntax is adopted to one-liner. Also, there is a cumbersome escaping of variable $dbusResponse to make it finally reach the systemd's config.
+    # OPTIMIZE: possibly create the script somewhere in /var/run or /run to reduce the overcomplicated code here.
+
+    lateCheckCommand="dbus-send --reply-timeout=2000 --type=method_call --system --dest=${LIGHTSON_STATS_CONNECTION_NAME} ${LIGHTSON_STATS_OBJECT} ${LIGHTSON_STATS_INTERFACE}.DoLateCheckIteration;
+ while read -r dbusResponse;
+ do
+    case \$dbusResponse in
+        *EnableReasonsleepSignal*)  exit 0;;
+        *DisableReasonsleepSignal*) exit 1;;
+    esac;
+ done < <( dbus-monitor --system \"type=signal,interface=${LIGHTSON_STATS_INTERFACE}\" );
+ kill \$!"
+
+    # Remove newlines, since systemd's ExecStart accepts only one line.
+    lateCheckCommand="${lateCheckCommand//$'\n'/}"
+
+    systemdService="
+[Unit]
+Description=lightson-ng late check - prevent sleep on condition
+Before=sleep.target
+
+[Service]
+ExecStart=bash -c '${lateCheckCommand}'
+
+Type=oneshot
+TimeoutSec=${lateCheckTimeout}
+
+[Install]
+RequiredBy=sleep.target"
+
+    # "root" user is needed to install a service.
+    if (( ! forceLateCheckService )) || [ "$USER" != "root" ]
+    then
+        logDebug "Skipping creation of systemd late check service"
+        return 0
+    fi
+
+    log "Creating runtime service $lateCheckServiceName"
+
+    # Add service to systemd and activate it.
+    # systemd-run helper is needed because systemctl itself can not edit services without tty (yet).
+    #shellcheck disable=SC2016
+    dbusResponse='$dbusResponse'
+
+    if systemdResponse=$( sudo systemd-run --collect --pty --service-type=oneshot --setenv=SYSTEMD_EDITOR=tee -- \
+    bash -c "dbusResponse='$dbusResponse'; echo \"${systemdService}\" | systemctl edit --runtime --full --force ${lateCheckServiceName} \
+             && systemctl daemon-reload && systemctl enable ${lateCheckServiceName}" 2>&1 )
+    then
+        logDebug "Late Check service installed: ${lateCheckServiceName}"
+        return 0
+    else
+        logError "Can not create Late Check service in systemd (rc=${rc}): ${systemdResponse}"
+        return 1
+    fi
+}
+
+lateCheckRemove()
+{
+    # Remove late check service from systemd.
+    local systemdResponse
+
+    if (( ! forceLateCheckService )) || [ "$USER" != "root" ]
+    then
+        logDebug "Skipping removal of late check service"
+        return 0
+    fi
+
+    log "Removing service ${lateCheckServiceName}"
+
+    systemdResponse=$( sudo bash -c "systemctl disable ${lateCheckServiceName} && systemctl daemon-reload && rm /run/systemd/system/${lateCheckServiceName}" 2>&1 ) || {
+        logError "Can not remove service ${lateCheckServiceName}: ${systemdResponse}"
+        return 1
+    }
+}
+
+dbusStatsCmd()
+{
+    # Call the method in lightson's DBUS stat module. Helper for *Stats() functions.
+    # parameters: $1 - (any) method name, $2 - (optional) first parameter to method, $3 - (optional) second parameter to method
+    #             $4 - (optional) flag to pass an empty second parameter to method.
+    local statsMethod="$1" statsParam1="" statsParam2="" rc dbusResponse dbusCmd
+
+    # How to send the signal directly from application:
+    #dbus-send --type=signal --${statsBusType} ${LIGHTSON_STATS_OBJECT} "${LIGHTSON_STATS_INTERFACE}.${1}"
+
+    # Wrap parameters with "string:"
+    [ -n "${2}" ] && statsParam1="string:${2}"
+
+    if [ -n "${3}" ]
+    then
+        # Note the absence of double/single parentheses around the value.
+        # In this case the value is passed correctly to the stat module.
+        # Note: d-feet shows a strange output when calling GetStats(): long string with spaces is split by parts like 'disable reason' 'is' '....'
+        # But when GetStats() is called from dbus-send the result is correct, so, assumed it is a bug in d-feet, not here.
+        statsParam2="string:${3}"
+    else
+        # Add the parameter if empty anyway, when this action is explicitly specified in parameter's key.
+        [ -n "$4" ] && [[ $4 = "$ALLOW_EMPTY_VALUE" ]] && statsParam2="string:"
+    fi
+
+    # Base command:
+    dbusCmd=("dbus-send" "--${statsBusType}" "--print-reply" "--dest=${LIGHTSON_STATS_CONNECTION_NAME}" "${LIGHTSON_STATS_OBJECT}" "${LIGHTSON_STATS_INTERFACE}.${statsMethod}")
+
+    # Add non-empty parameters.
+    [ -n "$statsParam1" ] && dbusCmd+=( "$statsParam1" )
+    [ -n "$statsParam2" ] && dbusCmd+=( "$statsParam2" )
+
+    logDebug "dbus: Cmd=${dbusCmd[*]}"
+
+    # Execute the command
+    dbusResponse=$("${dbusCmd[@]}")
+    rc=$?
+
+    logDebug "dbus: rc=${rc} resp=${dbusResponse}"
+    return $rc
+}
+
+launchStats()
+{
+    # Launch statistics module.
+    local rc statsCmd=("$statsModuleFile")
+
+    [ $useDbusStatsFlag -eq 0 ] && return 0
+
+    logDebug "Launch stat module."
+
+    # stat module is installed in system bus, so it needs root permissions.
+    [ "$USER" != "root" ] && {
+        logError "Stats module should be launched as root user to enable the Late Check. Fallback to session bus."
+        statsBusType="session"
+    }
+
+    # check executable permissions
+    [[ -f "${statsModuleFile}" && -r "${statsModuleFile}" && -x "${statsModuleFile}" ]] || {
+        logError "No permissions to launch stats module: ${statsModuleFile}"
+        return 1
+    }
+
+    # pass logging arguments to stats module
+    # Note: all output produced by stats module treated as debug messages.
+    if (( logStdout ))
+    then
+        statsCmd+=("--verbose")
+    else
+        statsCmd+=("--quiet")
+        statsCmd+=("--no-syslog")
+    fi
+
+    (( ! logSyslog )) && statsCmd+=("--no-syslog")
+
+    if (( debugMode ))
+    then
+        # Display dbus signals and messages.
+        (( debugDbusExtra )) && export G_DBUS_DEBUG="signal:message"
+    fi
+
+    statsCmd+=("&")
+
+    # Run stats module as a separate process.
+    eval "${statsCmd[*]}"
+
+    rc=$?
+    statsModulePid=$!
+    sleep $(( waitDelay + 1 ))
+    ps --pid "${statsModulePid}" >/dev/null || {
+        logError "Can not launch stats module. Process died."
+        statsModulePid=""
+        return 1
+    }
+
+    # Check if process did not die.
+    [ $rc -ne 0 ] && {
+        logError "Can not launch stats module. rc=${rc}"
+        statsModulePid=""
+        return 1
+    }
+
+    # Send the test variable to check availability of interface.
+    dbusStatsCmd "SetStats" "permissionsCheck" "1" || {
+        logError "No access to stat interface"
+        return 1
+    }
+}
+
+updateStats()
+{
+    # Collect and send statistics to lightson's DBUS stat module.
+    # Stats includes all PIDs, inhibitors set, reasons detected, checks performed, etc...
+    # whatever might be needed to display to the user in comfortable GUI environment, instead
+    # of grepping log files.
+    # Note: all the reasons (and checks performed) are collected separately the main loop.
+    local givenState Key
+
+    [ $useDbusStatsFlag -eq 0 ]  && return 0
+
+    logDebug "Update stats."
+
+    stats["runtimeErrors"]="$runtimeErrors"
+    stats["configFile"]="${configFile}"
+    stats["loopDelay"]="${loopDelay}"
+    stats["lightsonPid"]="$$"
+    stats["lightsonPath"]="$0"
+    stats["lightsonUser"]="$USER"
+    # shellcheck disable=SC2031
+    stats["guiUser"]="$guiUser"
+
+    for givenState in "${!powerManagementStateList[@]}"
+    do
+        stats["inhibitorType_${givenState}"]="${inhibitorType[$givenState]}"
+        stats["inhibitorUser_${givenState}"]="${inhibitorUser[$givenState]}"
+        stats["inhibitorPid_${givenState}"]="${inhibitorPid[$givenState]}"
+
+        # Store only the main disable reason here.
+        stats["disableReason_${givenState}"]="${disableReason[$givenState]}"
+    done
+
+    # Now send them all to DBUS
+    for Key in "${!stats[@]}"
+    do
+        dbusStatsCmd "SetStats" "${Key}" "${stats["$Key"]}" "${ALLOW_EMPTY_VALUE}" || {
+            logDebug "Can not SetStats for Key=${Key}, Value=${stats[$Key]}"
+            return 1
+        }
+    done
+
+    # Prepare for next iteration.
+    stats=()
+}
+
+doIterationTimeout()
+{
+    # Do the timeout between check/inhibit iterations.
+    # Either simply sleep, or pass control of the delay to the DBUS stats module.
+    if (( ! useDbusStatsFlag ))
+    then
+        sleep "$loopDelay"
+    else
+        # Let stats module wakeup the lightson.
+        dbusStatsCmd "SetTimer" "$loopDelay" || {
+            logError "Can not set timer"
+            return 1
+        }
+
+        log "Sleeping and waiting for signal from DBUS."
+        doLateCheckFlag=0
+        while read -r dbusResponse
+        do
+            case "$dbusResponse" in
+
+                *FinishLoopDelaySignal*)
+                    logDebug "Signal received: finishLoopDelaySignal"
+                    # Break waiting for a signal and start a new iteration.
+                    break
+                    ;;
+
+                *DoLateCheckIterationSignal*)
+                    logDebug "Signal received: doChecksSignal"
+                    # Break waiting for a signal and start a new iteration.
+                    # Note: this iteration will do all but setting inhibitors.
+                    #       It is required by Late check service.
+                    doLateCheckFlag=1
+                    break
+                    ;;
+            esac
+
+        done < <( dbus-monitor --${statsBusType} "type='signal',interface='${LIGHTSON_STATS_INTERFACE}'" )
+
+        # cleanup: dbus-monitor hangs forever if not killed.
+        monitorPid=$( ps --ppid $! -o pid= | tr -d ' ' | tail -1 )
+        kill -${killSignal} "$monitorPid" &>/dev/null
+        sleep $waitDelay
+
+        if ps --pid "${monitorPid}" >/dev/null
+        then
+                logError "can not kill dbus-monitor [${monitorPid}]"
+                return 1
+        else
+                logDebug "monitor PID killed: $monitorPid"
+        fi
+    fi
+
+    return 0
+}
+
+init4shellcheck() {
+  # Dummy initialization of variables for shellcheck, to avoid
+  # annoying messages in PyCharm GUI.
+  detectFullscreenAppPlaying="$detectFullscreenAppPlaying"
+  detectAudioPlaying="$detectAudioPlaying"
+  detectNetworkLoadHigh="$detectNetworkLoadHigh"
+  detectNetworkConnectionExists="$detectNetworkConnectionExists"
+  detectCpuLoadHigh="$detectCpuLoadHigh"
+  detectInhibitFileExist="$detectInhibitFileExist"
+  detectMediaPlayerPlaying="$detectMediaPlayerPlaying"
+  detectDelayProgRunning="$detectDelayProgRunning"
+}
+
+# ************************************************ MAIN()
+
+# Dummy init for shellcheck
+init4shellcheck
+
+# Parse command line options.
+parseCommandLine "$@"
+
+# Create lock file.
+pidCreate
+
+# Set the trap with exit code (possibly) provided in the loop.
+trap 'pidRemove $?' EXIT
+
+# getGuiVariables() will save GUI environment variables into this file.
+# Security guru will scream here...
+if guiEnvFile="$( mktemp --suffix $lightsOnLogTag )"
+then
+    chmod go+r "$guiEnvFile"
+else
+  logError "can not create guiEnvFile: $guiEnvFile"
+fi
+
+# Read configuration settings from file.
+# Configuration file name is either passed via arguments
+# or file is searched in predefined paths.
+(( argumentPassed["configFile"] )) || findConfigFile
+
+if [ -n "$configFile" ]
+then
+    log "Reading config from: $configFile"
+    # shellcheck source=/etc/lightson-ng.conf
+    source "$configFile" || die "Can not read config file: $configFile"
+    
+    # Restore arguments passed via command line.
+    for oneOption in "${!argumentPassed[@]}"
+    do
+        eval "$oneOption=\"${argumentPassed[$oneOption]}\""
+    done
+fi
+
+# Always read config dynamically in debug mode.
+(( debugMode )) && dynamicConfig=1
+
+# Delaying screensaver needs "pushing" constantly, every iteration.
+# So, unfortunately we should refuse the inspection of previous state.
+(( forceDelayScreensaver )) && previousStateDisabledInspect=0
+
+log "Starting lightson-ng for user [$USER]"
+
+# Recovering default PM setting for GDM schema, if requested.
+restorePmSettings
+
+# Integrate lightson into systemd's sleep chain.
+lateCheckAdd
+
+# Launch statistics module.
+# Do not collect statistics if launch failed.
+launchStats || useDbusStatsFlag=0
+
+while true
+do
+    # Read config dynamically.
+    if (( dynamicConfig )) && [ -n "$configFile" ]
+    then
+        logDebug "Dynamically reading config from: $configFile"
+        # shellcheck source=/etc/lightson-ng.conf
+        source "$configFile" || logError "Can not read config file: $configFile"
+    fi
+
+    # Check if GUI user is logged in and GUI is available.
+    getGuiVariables
+
+    # Calculate loop delay if dynamic, check limits of delay if static.
+    calculateLoopDelay
+
+    # Detect the type of screensaver used by the system.
+    # Disabling PM states depend on this type: if gnome3 is detected, then state inhibitors are used,
+    # otherwise - screensaver is just delayed.
+    # Currently gnome's DelayScreensaver does not work (bug in gnome?), therefore inhibitors is preferable choice.
+    # Hoping that non-gnome3 systems have a working DelayScreensaver.
+    # Note: gnome3's checks and actions do not depend on screensaver running.
+    detectScreensaver
+
+    # Perform all checks to detect whether idle or/and sleep states should be disabled.
+    doAllChecks
+
+    # Disable/enable idle/sleep states.
+    handlePmState || logError "Can not handle PM state."
+
+    # Update statistics in DBUS stats module.
+    updateStats || logError "Can not update statistics."
+
+    # Inform DBUS that iteration is finished.
+    #dbusStatsSignal "iterationFinishedSignal"
+    dbusStatsCmd "IterationFinished"
+
+    # Wait between iterations.
+    doIterationTimeout || die "Can not do iteration timeout."
+
+done
