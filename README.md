@@ -136,7 +136,7 @@ A star icon in tray indicates that lightson-ng is installed and running OK.
 lightson-ng executes the infinite loop. Within the loop, checks are performed for events that need an idle/sleep modes to be prevented. If at least one reason is found to disable PM state, a new inhibitor is set. During all time the inhibitor is set, PC can not go to idle/sleep mode, the screensaver is not activated, the screen is not locked, the screen does not blank. If the inhibitor is already set on the previous iteration - it remains untouched. If all checks provide no single reason to disable PM state, the inhibitor removed. 
 Lightson-ng consists of several processes: lightson-ng bash script, Stats DBUS service, Late Check systemd unit, lightson Indicator GUI. Processes communicate with each other using the DBUS signals.
 ## Architecture
-![Architecture of lightson-ng](file:///home/myuser/src/lightson-ng/doc/lightson-ng-architecture.jpg)
+![Architecture of lightson-ng](https://github.com/LehValensa/lightson-ng/blob/master/doc/lightson-ng-architecture.jpg)
 ## Primary operations
 ```mermaid
 sequenceDiagram

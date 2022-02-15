@@ -4,11 +4,11 @@
   Status indicator GUI for lightson-ng.
   URL: https://github.com/LehValensa/lightson-ng
 
-  Copyright (c) 2022 grytsenko.alexander at gmail com
+  Copyright (c) 2022 grytsenko . alexander at gmail com
   This script is licensed under GNU GPL version 2.0 or above
 
   Based on:
-  launcher_indicator.py by @author: HUC Stéphane, @email: <devs@stephane-huc.net>, @url: http://stephane-huc.net
+  launcher_indicator.py by @author: HUC Stéphane, @email: <devs@stephane-huc.net>, @url: https://stephane-huc.net
 """
 
 
@@ -826,6 +826,7 @@ class LightsonStatisticsWindow(Gtk.Window):
 
 class LightsonLogsWindow(Gtk.Window):
     def __init__(self):
+        # noinspection PyArgumentList
         super().__init__(title="lightson-ng logs")
         self.set_border_width(10)
         self.set_default_size(1000, 500)

@@ -35,7 +35,7 @@ SERVICE_FILE="${SERVICE}.service"
     exit 1
 }
 
-apt install $ADD_DPKG
+apt install "$ADD_DPKG"
 
 # Copy
 # TODO: try "install" command to improve reduce the amount of code.
