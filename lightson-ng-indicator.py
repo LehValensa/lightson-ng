@@ -13,6 +13,7 @@
 
 
 import sys
+import os
 import time
 import subprocess
 import signal
@@ -257,6 +258,10 @@ class LightsonIndicator:
         item_force_check.connect('activate', self.on_check)
         menu.append(item_force_check)
 
+        item_inhibit = Gtk.CheckMenuItem(label='Force inhibit')
+        item_inhibit.connect('activate', self.on_force_inhibit)
+        menu.append(item_inhibit)
+
         item_show_stats = Gtk.MenuItem(label='Show stats')
         item_show_stats.connect('activate', self.on_show_stats)
         menu.append(item_show_stats)
@@ -495,6 +500,30 @@ class LightsonIndicator:
             time.sleep(1)
 
         log("timeout reached")
+
+    # noinspection PyUnusedLocal
+    def on_force_inhibit(self, source):
+        """
+        Set/remove the inhibitor manually.
+        :return:
+        """
+
+        filename = str(self.stats_all['inhibitFile'])
+        if source.get_active():
+            try:
+                if not os.path.isfile(filename):
+                    open(filename, 'w').close()
+            except IOError:
+                self.log_error("Can not create inhibit file: " + filename)
+        else:
+            try:
+                if os.path.isfile(filename):
+                    os.unlink(filename)
+            except OSError:
+                self.log_error("Can not remove inhibit file: " + filename)
+
+        # execute lightson-ng to update the status
+        self.on_check(source)
 
     # noinspection PyUnusedLocal
     def on_show_logs(self, source):

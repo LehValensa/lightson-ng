@@ -1917,6 +1917,7 @@ updateStats()
     stats["lightsonUser"]="$USER"
     # shellcheck disable=SC2031
     stats["guiUser"]="$guiUser"
+    stats["inhibitFile"]="$inhibitFile"
 
     for givenState in "${!powerManagementStateList[@]}"
     do

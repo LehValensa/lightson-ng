@@ -323,6 +323,8 @@ Current lightson's status is shown in the Indicator's icon:
 A text label is set on the right of the icon. The label provides more detailed status information. It displays "X" in the label if disable reason found. First character corresponds to the Idle reason, second - to the Sleep reason. "ERR" - means: the error occurred in lightson-ng service.
 ## Force check
 Ask the lightson-ng to perform checks. Status icon and label are updated with the result of the checks performed.
+## Force inhibit
+Set the inhibitor manually, by creating a specially named file in /tmp/ directory. Both idle and sleep modes becoming inhibited. A second click on the menu "Force inhibit" removes the inhibitor.
 ## Show stats
 Display the window with the lightson-ng statistics.
 ## Show logs
