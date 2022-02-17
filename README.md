@@ -247,7 +247,7 @@ The following can be configured:
 >Flags are set to True by setting the value to 1, to False by setting the value to 0
 
 Changing variables after the line "Below are non configurable variables" is forbidden, and usually makes no sense, since most of them are changed during runtime.
-See example of configuration file here: [doc/lightson-ng.config](doc/lightson-ng.config)
+See example of configuration file here: [doc/lightson-ng.config](doc/lightson-ng.conf)
 
 ## Search paths
 Config-files are searched in the following order:
