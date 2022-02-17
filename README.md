@@ -1,5 +1,5 @@
 # Purpose
-**lightson-ng** is a bash script that prevents Power Management idle/sleep modes and/or the screensaver and display power management (DPMS) from being activated by checking if system is performing specified actions, such as:  
+**lightson-ng** is a bash script that prevents Power Management idle/sleep modes and/or the screensaver and display power management (DPMS) from being activated by checking if system is performing specified actions, such as:
 - running specific programs, ex. Transmission, rsnapshot backup;
 - while watching full-screen videos on Firefox, Chrome and Chromium. Media players like mplayer, VLC and minitube can also be detected;
 - when MPRIS Media Player is playing. Example: YouTube will be detected when playing, since YouTube uses MPRIS in the back-end;
@@ -11,12 +11,13 @@
 If check provided a reason to prevent PM mode, script installs inhibitor(s) of idle/sleep modes.
 >lightson-ng is designed for and works in the default Ubuntu 20.04 LTS: a desktop installation using Gnome 3. The other Linux distributions and desktop environments are not tested.
 ## Credits
-The script uses the idea of lightsOn.sh script which was a great helper until Ubuntu had grown up and drastically modified its Power Management design, so the old lightsOn.sh stopped working completely, without leaving a chance that a small change in it will fix everything. In the modern systems, instead of delaying the screensaver, an **inhibitor is set** which inhibits the system to go into the idle/sleep mode. Considering these changed rules, current lightson-ng script was written from scratch reusing about 5% of the code from the original lightsOn.sh. lightson-ng is a **New Generation** of lightsOn and is working with Ubuntu 20.04 LTS. Note: lightson-ng preserved the screensaver delay functionality, but it is handled a bit differently, and generally is not a recommended way to go - use inhibitors instead.
+The script uses the idea of lightsOn.sh script which was a great helper until Ubuntu had grown up and drastically modified its Power Management design, so the old lightsOn.sh stopped working completely, without leaving a chance that a small change in it will fix everything. In the modern systems, instead of delaying the screensaver, an **inhibitor is set** which inhibits the system to go into the idle/sleep mode. Considering these changed rules, current lightson-ng script was written from scratch reusing about 5% of the code from the original lightsOn.sh. lightson-ng is a **New Generation** of lightsOn and is working with Ubuntu 20.04 LTS.
+>lightson-ng preserved the screensaver delay functionality, but it is handled a bit differently, and generally is not a recommended way to go - use inhibitors instead.
 
 Many thanks to author of the original lightsOn.sh (iye.cba) for the simple and brilliant script that worked for me many years, until I upgraded to the new Ubuntu. Also, I want to thank to contributors of lightsOn's forks who gave me many ideas in their code to implement them in the lightson-ng (such as dynamic loop delay).
 # Table of contents
 <div class="stackedit__toc">
-  
+
 <ul>
 <li><a href="#purpose">Purpose</a>
 <ul>
@@ -62,6 +63,7 @@ Many thanks to author of the original lightsOn.sh (iye.cba) for the simple and b
 <ul>
 <li><a href="#status-icon-and-label">Status icon and label</a></li>
 <li><a href="#force-check">Force check</a></li>
+<li><a href="#force-inhibit">Force inhibit</a></li>
 <li><a href="#show-stats">Show stats</a></li>
 <li><a href="#show-logs">Show logs</a></li>
 <li><a href="#startstop-service">Start/stop service</a></li>
@@ -125,18 +127,19 @@ Many thanks to author of the original lightsOn.sh (iye.cba) for the simple and b
 3. Run the installation:
 `sudo install-lightson`
 This will:
-	- install lightson-ng scripts to /usr/local/bin/ directory,
-	- install the additional required packages from the Ubuntu repository,
-	- create and launch lightson-ng service in systemd, enable the service at boot,
-	- add the necessary permissions for DBUS service.
+    - install lightson-ng scripts to /usr/local/bin/ directory,
+    - install the additional required packages from the Ubuntu repository,
+    - create and launch lightson-ng service in systemd, enable the service at boot,
+    - add the necessary permissions for DBUS service.
 4. Launch the Indicator application for monitoring:
 `lightson-ng-indicator.py`
 A star icon in tray indicates that lightson-ng is installed and running OK.
 # How it works
-lightson-ng executes the infinite loop. Within the loop, checks are performed for events that need an idle/sleep modes to be prevented. If at least one reason is found to disable PM state, a new inhibitor is set. During all time the inhibitor is set, PC can not go to idle/sleep mode, the screensaver is not activated, the screen is not locked, the screen does not blank. If the inhibitor is already set on the previous iteration - it remains untouched. If all checks provide no single reason to disable PM state, the inhibitor removed. 
+lightson-ng executes the infinite loop. Within the loop, checks are performed for events that need an idle/sleep modes to be prevented. If at least one reason is found to disable PM state, a new inhibitor is set. During all time the inhibitor is set, PC can not go to idle/sleep mode, the screensaver is not activated, the screen is not locked, the screen does not blank. If the inhibitor is already set on the previous iteration - it remains untouched. If all checks provide no single reason to disable PM state, the inhibitor removed.
 Lightson-ng consists of several processes: lightson-ng bash script, Stats DBUS service, Late Check systemd unit, lightson Indicator GUI. Processes communicate with each other using the DBUS signals.
+> idle and sleep modes are treated by lightson separately: an individual inhibitor is set for each of these modes.
 ## Architecture
-![Architecture of lightson-ng](https://github.com/LehValensa/lightson-ng/blob/master/doc/lightson-ng-architecture.jpg)
+![Architecture of lightson-ng](doc/lightson-ng-architecture.png)
 ## Primary operations
 ```mermaid
 sequenceDiagram
@@ -147,7 +150,7 @@ participant  Stats
 participant  Indicator
 Note left of Indicator: 1) Start the service<br/>(manually)
 opt Manual start
-	Indicator ->> System: launch lightson-ng service
+    Indicator ->> System: launch lightson-ng service
 end
 Note right of Lightson: 2) Startup<br/>
 System ->>+Lightson: launch the service
@@ -155,21 +158,21 @@ Lightson ->>Late Check: add the Late Check<br/>service
 Lightson ->>-Stats: launch Stats service
 System ->> Indicator: launch the indicator applet
 rect  rgb(191, 223, 255)
-loop Main Loop
-	System -->>Lightson: read config
-	System -->>Lightson: get GUI variables
-	System -->> Lightson: get the Idle counter
-	Lightson ->> Lightson: calculate the loop delay
-	rect  rgb(200, 150, 255)
-		Lightson ->> System: perform all checks
-		alt Disable reason found
-			Lightson ->> System: set the inhibitor
-		end
-	end
-	Lightson ->> Stats: update stats
-	System -->> Indicator: update the log window
-	Lightson -) Lightson: do iteration timeout
-end
+    loop Main Loop
+        System -->>Lightson: read config
+        System -->>Lightson: get GUI variables
+        System -->> Lightson: get the Idle counter
+        Lightson ->> Lightson: calculate the loop delay
+        rect  rgb(200, 150, 255)
+            Lightson ->> System: perform all checks
+            alt Disable reason found
+                Lightson ->> System: set the inhibitor
+            end
+        end
+        Lightson ->> Stats: update stats
+        System -->> Indicator: update the log window
+        Lightson -) Lightson: do iteration timeout
+    end
 end
 ```
 ## Other operations
@@ -185,13 +188,13 @@ System ->> Late Check: sleep.target reached.<br/>Can PC sleep?
 Late Check ->>Lightson: perform checks only
 Lightson ->> Lightson: do new iteration
 alt disable reason found
-	Lightson -->>Late Check: disable reason found
-	Late Check -->> System: PC can not sleep
-	System ->> System: interrupt suspending
+    Lightson -->>Late Check: disable reason found
+    Late Check -->> System: PC can not sleep
+    System ->> System: interrupt suspending
 else no reasons found
-	Lightson -->>Late Check: no reasons found
-	Late Check -->> System: PC can sleep
-	System ->> System: continue to suspend
+    Lightson -->>Late Check: no reasons found
+    Late Check -->> System: PC can sleep
+    System ->> System: continue to suspend
 end
 Note left of Indicator: 4) Checks that are<br/> initiated manually<br/>
 Indicator ->> Stats: force new check
@@ -206,22 +209,22 @@ Stats -->> Indicator: display stats
 The installation process is described in "Quick start". Below are just some details.
 lightson-ng service is installed and run under the root account.
 - Executables are copied to /usr/local/bin directory for convenient search via PATH variable:
-	- lightson-ng bash script
-	- lightson-ng-stat.py python script
-	- lightson-ng-indicator.py python script
+    - lightson-ng bash script
+    - lightson-ng-stat.py python script
+    - lightson-ng-indicator.py python script
 Also, execute permissions are added to these scripts.
 - lightson-ng.service file contains the necessary information to run lightson-ng as a service under control of systemd. Service file is copied to /lib/systemd/system directory. Installation script runs systemctl commands to enable the service at boot time. Also, installation script starts the service itself.
 - lightson-ng-stat.conf file contains a list of permissions required to use the Stats DBUS service. This file is copied to /etc/dbus-1/system.d/ directory. The installation script reloads dbus configuration to apply permissions.
 - The following Ubuntu packages are installed:
-	- net-tools - contains `netstat` command which is used by network connection check.
-	- sysstat - contains `sar` command which is used by network load check.
-	- gir1.2-appindicator3-0.1 - contains Appindicator3 python API used by lightson-ng-indicator.py script.
-	- gnome-icon-theme - contains icons used by lightson-ng-indicator.py.
+    - net-tools - contains `netstat` command which is used by network connection check.
+    - sysstat - contains `sar` command which is used by network load check.
+    - gir1.2-appindicator3-0.1 - contains Appindicator3 python API used by lightson-ng-indicator.py script.
+    - gnome-icon-theme - contains icons used by lightson-ng-indicator.py.
 - lightson-ng-indicator.py is a user-space monitoring tool that can be manually added to auto-launch of X session login. Either use `Startup Applications` or execute the following commands:
-	```
-	cp lightson-ng-indicator.desktop $HOME/.local/share/applications/
-	ln -sf $HOME/.local/share/applications/lightson-ng-indicator.desktop $HOME/.config/autostart/
-	```
+    ```
+    cp lightson-ng-indicator.desktop $HOME/.local/share/applications/
+    ln -sf $HOME/.local/share/applications/lightson-ng-indicator.desktop $HOME/.config/autostart/
+    ```
 - Late Check service does not require installation, since it is runtime service that is created by lightson-ng script when lightson-ng service is launched.
 # Run
 - lightson-ng service is started automatically by systemd
@@ -244,6 +247,8 @@ The following can be configured:
 >Flags are set to True by setting the value to 1, to False by setting the value to 0
 
 Changing variables after the line "Below are non configurable variables" is forbidden, and usually makes no sense, since most of them are changed during runtime.
+See example of configuration file here: [doc/lightson-ng.config](doc/lightson-ng.config)
+
 ## Search paths
 Config-files are searched in the following order:
 1. $HOME/.config/lightson-ng/lightson-ng.conf
@@ -312,6 +317,7 @@ If logStdout is turned on, then messages are printed to screen. Primarily used f
 # Monitoring with Indicator
 Monitoring of lightson-ng is simplified with lightson-ng-indicator.py.
 Indicator mainly provides a status of lightson-ng service, also it is possible to execute an unscheduled check, start/stop the lightson-ng service, read logs for troubleshooting.
+![indicator_menu](doc/indicator_menu_sshot.png)
 ## Status icon and label
 Current lightson's status is shown in the Indicator's icon:
 - non-starred icon - if no disable reasons found
@@ -321,26 +327,43 @@ Current lightson's status is shown in the Indicator's icon:
 - dialog-error icon - if Indicator itself encountered an error.
 
 A text label is set on the right of the icon. The label provides more detailed status information. It displays "X" in the label if disable reason found. First character corresponds to the Idle reason, second - to the Sleep reason. "ERR" - means: the error occurred in lightson-ng service.
+
+Examples:
+
+![indicator_in_tray](doc/indicator_in_tray_sshot.png) - no disable reasons found
+
+![indicator_semi_starred](doc/indicator_semi_starred.png) - disable reason is found for the sleep mode
+
+![indicator_starred](doc/indicator_starred.png) - disable reason is found for both idle and sleep modes
+
 ## Force check
 Ask the lightson-ng to perform checks. Status icon and label are updated with the result of the checks performed.
 ## Force inhibit
-Set the inhibitor manually, by creating a specially named file in /tmp/ directory. Both idle and sleep modes becoming inhibited. A second click on the menu "Force inhibit" removes the inhibitor.
+Set the inhibitor manually, by creating a specially named file in /tmp/ directory. Both idle and sleep modes becoming inhibited. A checkbox indicating the state of inhibitor is displayed on the left side of the menu item.
+A second click on the menu "Force inhibit" removes the inhibitor.
+This is an analogue of [caffeine](https://launchpad.net/caffeine) tool.
 ## Show stats
-Display the window with the lightson-ng statistics.
+Display the window with the lightson-ng statistics. Example:
+![stats_window](doc/stats_window.png)
 ## Show logs
 Display last logs of lightson-ng process itself and its dbus service in the new window.
 ## Start/stop service
-Start/stop the lightson-ng service manually.  
+Start/stop the lightson-ng service manually.
 > normally the service should be started by systemd at boot.
 # Troubleshooting
-When something does not work as expected, stop lightson-ng service:
-`sudo service lighton-ng stop`
-and execute lightson-ng script manually:
-`sudo lightson-ng --verbose --debug-on`
-check logs:
-`cat /var/log/syslog | grep lightson`
+When something does not work as expected, firstly use the lightson-indicator:
+- Open Stats window with disable reasons, check results and other information, perhaps it will give you a hint.
+- Click on "Show logs" to browse the details of lightson-ng execution.
 
-If needed, execute the indicator manually:
+If Indicator does not help:
+- stop the lightson-ng service:
+`sudo service lighton-ng stop`
+- and execute the lightson-ng script manually:
+`sudo lightson-ng --verbose --debug-on`
+- check logs either manually:
+`cat /var/log/syslog | grep lightson` or with a help from Indicator's log window.
+
+If needed, execute the Indicator manually:
 `lightson-ng-indicator.py --verbose`
 ## Turning on verbose mode
 Verbose mode is turned on to display messages on screen. It is turned on by -v or --verbose command-line option for lightson-ng and lightson-ng-indicator.py programs.
@@ -350,11 +373,16 @@ Debug mode for lightson-ng also can be turned by option debugMode in config-file
 
 # GUI available/not available
 Right after the boot, when no user is logged into X session, there is no X session started, obviously. It means that Idle mode is not available, no screensaver can be started, no processes having DISPLAY variable defined. PC can not go idle, but can go into the sleep mode. In terms of lightson-ng it means "GUI is not available". In this mode lightson-ng can perform checks that do not require GUI and can inhibit sleep mode.
-When a user is logged into X session, there are processes created having DISPLAY variable defined, GUI becomes available. Also, the idle counter becomes available, correspondingly PC can go idle. When lightson-ng detects availability of GUI, it "steals" environment variables from the active GUI session and then uses these variables to perform GUI-dependent checks and inhibits of the idle mode. Particularly, environment variables are taken from the `gnome-session-binary` process. Besides, a username who is running X session becomes known.
+
+When a user is logged into X session, there are processes created having DISPLAY variable defined, GUI becomes available. Also, the idle counter becomes available, correspondingly PC can go idle.
+
+When lightson-ng detects availability of GUI, it "steals" environment variables from the active GUI session and then uses these variables to perform GUI-dependent checks and inhibits of the idle mode. Particularly, environment variables are taken from the `gnome-session-binary` process. Besides, a username who is running X session becomes known.
 GUI availability is checked by lightson on every iteration, so when X session is finished or another user is logged in - lightson-ng knows about it.
 # Loop control
 After every iteration, when all checks are performed and inhibitors are set, lightson-ng sleeps and waits to start a new iteration. This waiting time is very important for the entire process: in one hand the sleep delay should not be too short to save CPU resources, in other hand lightson-ng should not miss the moment when the PC goes to the idle or sleep mode.
+
 The simplest (but not the smartest) way is to set a fixed, **static** value of loopDelay variable, let's say 60 seconds. If a system has an idle timeout configured for 10 minutes, then chances are high that lightson-ng can set the inhibitor before the idle mode activates.
+
 A better (but still not the ideal) way is to use **Dynamic Loop Delay**: dynamicLoopDelay=1. In this case the delay is calculated automatically: an idle or sleep timeout (whichever is smaller) is taken as the base of calculations. The current value of idle counter is taken from the system and subtracted from timeout. The resulting value is how much time left before the system will go idle. Some small amount of "spare" time is subtracted even more, to let the lightson-ng perform checks before timeout occurs. Thus next lightson's iteration is "precisely" placed in the timeline, exactly before the idle timeout happens.
 
 Loop delay can be either done by "**sleep**" command, or by setting a **timer** in DBUS Stats service. In latter case lightson can be controlled by lightson-ng-indicator via DBUS and the Late Check service can work properly because the delay is interrupted by signals:
@@ -383,7 +411,10 @@ In general, delaying the screensaver is a less preferable option over setting th
 Unfortunately inhibitors do not control DPMS. Therefore DPMS disable/enable is performed as an additional step when disabling/enabling idle state.
 >DPMS control is not used for sleep state control.
 # Late check service
-When using a dynamic loop delay, chances that lighton-ng will miss unwanted sleep state are very low, but still they are. The Late Check service does the job to prevent the sleep mode for sure. It is added as a runtime systemd service into the chain between the sleep.target and the actual call to suspend the system. Issues DBUS signal "DoLateCheckSignal" asking lightson-ng for performing checks. lightson-ng performs checks only (no inhibitors are set/removed) and returns the result in the form of signals EnableReasonsleepSignal and DisableReasonsleepSignal.
+When using a dynamic loop delay, chances that lighton-ng will miss unwanted sleep state are very low, but still they are. The Late Check service does the job to **prevent the sleep mode for sure**. It is added as a runtime systemd service into the chain between the sleep.target and the actual call to suspend the system.
+
+Issues DBUS signal "DoLateCheckSignal" asking lightson-ng for performing checks. lightson-ng performs **checks only** (no inhibitors are set/removed) and returns the result in the form of signals EnableReasonsleepSignal and DisableReasonsleepSignal.
+
 A drawback of using Late Check is a strange behavior in system logs. At least, some processes (namely DBUS-controlled, such as Network Manager) are already ready to sleep before the sleep.target is reached. It should not be so, but it is, so that the behavior of the absolutely correct system's is not expected.
 
 Generally, the use of Late Check should be avoided as much as possible, and, thanks to the dynamic loop delay, it is. Late Check will surely work when the "Suspend" button is pressed. Therefore, if the PC does not go to sleep from the keyboard - check if lightson-ng did not set any inhibitors, shutdown the lightson-ng service if necessary.
@@ -391,9 +422,11 @@ Generally, the use of Late Check should be avoided as much as possible, and, tha
 # DBUS statistics service
 Since bash can not create DBUS service, a python helper script is developed: lightson-ng-stat.py
 The script is called directly from lightson-ng and installs DBUS service "org.LightsOn.StatService".
+
 The service has one interface, "org.LightsOn.StatInterface" that proposes one object "/LightsOnStat".
 The service collects statistics from lightson-ng service to pass it to lightson-ng-indicator GUI upon request from it.
 Also, service controls dynamic loop delay of lightson-ng.
+
 Signals are generated by statistics service. All clients are only signal recipients. If there is a need to generate a signal, a corresponding method is called.
 
 ## Collecting statistics from lightson-ng: SetStats()
@@ -431,46 +464,34 @@ An action handler can be overwritten in config file. It is very unlikely to be n
 It is possible to recover PM settings in gnome, if something is broken in Power Management settings of GDM user (one that is used when no user is logged in).
 
 # Design
+Why the bash scripting language is chosen for the core functionality? Because the original lightOn.sh is written in bash, and then around 200 forks of lightsOn.sh are also used bash - people were chosen bash, possibly because of its simplicity, portability and wide spreading.
 
+The other option was to use Python, then the script would be simpler, the architecture would be better because Stats module could be integrated into the script, eliminating a weird `dbus-monitor` use, flagging, etc. But external calls of Unix tools, especially when performing checks, would be more complicated, thus not easily understandable and (re)writeable by users.
+
+The last option is to use a C language. Benefits: Gio libraries are native for C, better tested than Python's bindings, the code is compact, fast, portable. Disadvantages: everything else.
 
 ## Integration into systemd
 Systemd proposes the very convenient way to create and run a service. In order to be controlled by systemd, properly located in the service startup chain, the service needs to be configured as a unit.
 - **`lightson-ng.service`** - is a permanent systemd's unit. Service launches the lightson-ng script after the network becomes available. A minimal environment is set for this unit. The environment is required by the script to find an external utility such as `sar`,  `awk`, etc. A home directory is also set to find the config-file there, if any. The script is stopped by a simple `kill` command. The service is started automatically every boot for multi-user.target. The service can be operated as any other systemd service:
-`systemctl disable lightson-ng` - disable service in systemd, so it will not start at boot
-`systemctl enable lightson-ng` - enable the service in systemd, so it will start at boot
-`service lightson-ng start` - start the service manually
-`service lightson-ng stop` - stop the service
-`service lightson-ng status` - check status of the service. Example of status with the sleep inhibitor set:
-```
-● lightson-ng.service - lightson-ng service - prevent sleep and screen lock
-     Loaded: loaded (/etc/systemd/system/lightson-ng.service; enabled; vendor preset: enabled)
-     Active: active (running) since Sun 2022-02-13 01:58:39 EET; 6s ago
-   Main PID: 126697 (bash)
-      Tasks: 15 (limit: 28700)
-     Memory: 16.6M
-     CGroup: /system.slice/lightson-ng.service
-             ├─126697 bash /usr/local/bin/lightson-ng --quiet
-             ├─126810 python3 /usr/local/bin/lightson-ng-stat.py --quiet --no-syslog
-             ├─126949 bash /usr/local/bin/lightson-ng --quiet
-             ├─126951 sudo --user myuser bash -c set -a; source /tmp/tmp.zIUOzFv2onlightson-ng; gnome-session-inhibit --inhibit suspend --reason lightson-ng --app-id lightson-ng s>
-             ├─126952 bash -c set -a; source /tmp/tmp.zIUOzFv2onlightson-ng; gnome-session-inhibit --inhibit suspend --reason lightson-ng --app-id lightson-ng sleep infinity
-             ├─126953 gnome-session-inhibit --inhibit suspend --reason lightson-ng --app-id lightson-ng sleep infinity
-             ├─126957 sleep infinity
-             ├─127018 bash /usr/local/bin/lightson-ng --quiet
-             └─127019 dbus-monitor --system type='signal',interface='org.LightsOn.StatInterface'
-
-Feb 13 01:58:43 myhost sudo[126931]: pam_unix(sudo:session): session closed for user myuser
-Feb 13 01:58:43 myhost sudo[126936]:     root : TTY=unknown ; PWD=/ ; USER=myuser ; COMMAND=/usr/bin/bash -c set -a; source /tmp/tmp.zIUOzFv2onlightson-ng; pacmd list-sink-inputs
-Feb 13 01:58:43 myhost sudo[126936]: pam_unix(sudo:session): session opened for user myuser by (uid=0)
-Feb 13 01:58:43 myhost sudo[126936]: pam_unix(sudo:session): session closed for user myuser
-Feb 13 01:58:43 myhost lightson-ng[126697]: a program from delay list [transmission-gtk] is running
-Feb 13 01:58:43 myhost lightson-ng[126697]: Disabling sleep state because a program from delay list [transmission-gtk] is running
-Feb 13 01:58:43 myhost sudo[126951]:     root : TTY=unknown ; PWD=/ ; USER=myuser ; COMMAND=/usr/bin/bash -c set -a; source /tmp/tmp.zIUOzFv2onlightson-ng; gnome-session-inhibit >
-Feb 13 01:58:43 myhost sudo[126951]: pam_unix(sudo:session): session opened for user myuser by (uid=0)
-Feb 13 01:58:44 myhost lightson-ng[126697]: sleep inhibitor [126957] of type gnome is added
-Feb 13 01:58:44 myhost lightson-ng[126697]: Sleeping and waiting for signal from DBUS.
-
-```
+  - `systemctl disable lightson-ng` - disable service in systemd, so it will not start at boot
+  - `systemctl enable lightson-ng` - enable the service in systemd, so it will start at boot
+  - `service lightson-ng start` - start the service manually
+  - `service lightson-ng stop` - stop the service
+  - `service lightson-ng status` - check status of the service. Example of status with the sleep inhibitor set:
+    ```
+    ● lightson-ng.service - lightson-ng service - prevent sleep and screen lock Loaded: loaded (/etc/systemd/system/lightson-ng.service; enabled; vendor preset: enabled) Active: active (running) since Sun 2022-02-13 01:58:39 EET; 6s ago Main PID: 126697 (bash) Tasks: 15 (limit: 28700) Memory: 16.6M CGroup: /system.slice/lightson-ng.service ├─126697 bash /usr/local/bin/lightson-ng --quiet ├─126810 python3 /usr/local/bin/lightson-ng-stat.py --quiet --no-syslog ├─126949 bash /usr/local/bin/lightson-ng --quiet ├─126951 sudo --user myuser bash -c set -a; source /tmp/tmp.zIUOzFv2onlightson-ng; gnome-session-inhibit --inhibit suspend --reason lightson-ng --app-id lightson-ng s> ├─126952 bash -c set -a; source /tmp/tmp.zIUOzFv2onlightson-ng; gnome-session-inhibit --inhibit suspend --reason lightson-ng --app-id lightson-ng sleep infinity ├─126953 gnome-session-inhibit --inhibit suspend --reason lightson-ng --app-id lightson-ng sleep infinity ├─126957 sleep infinity ├─127018 bash /usr/local/bin/lightson-ng --quiet └─127019 dbus-monitor --system type='signal',interface='org.LightsOn.StatInterface'
+    Feb 13 01:58:43 myhost sudo[126931]: pam_unix(sudo:session): session closed for user myuser
+    Feb 13 01:58:43 myhost sudo[126936]:     root : TTY=unknown ; PWD=/ ; USER=myuser ; COMMAND=/usr/bin/bash -c set -a; source /tmp/tmp.zIUOzFv2onlightson-ng; pacmd list-sink-inputs
+    Feb 13 01:58:43 myhost sudo[126936]: pam_unix(sudo:session): session opened for user myuser by (uid=0)
+    Feb 13 01:58:43 myhost sudo[126936]: pam_unix(sudo:session): session closed for user myuser
+    Feb 13 01:58:43 myhost lightson-ng[126697]: a program from delay list [transmission-gtk] is running
+    Feb 13 01:58:43 myhost lightson-ng[126697]: Disabling sleep state because a program from delay list [transmission-gtk] is running
+    Feb 13 01:58:43 myhost sudo[126951]:     root : TTY=unknown ; PWD=/ ; USER=myuser ; COMMAND=/usr/bin/bash -c set -a; source /tmp/tmp.zIUOzFv2onlightson-ng; gnome-session-inhibit >
+    Feb 13 01:58:43 myhost sudo[126951]: pam_unix(sudo:session): session opened for user myuser by (uid=0)
+    Feb 13 01:58:44 myhost lightson-ng[126697]: sleep inhibitor [126957] of type gnome is added
+    Feb 13 01:58:44 myhost lightson-ng[126697]: Sleeping and waiting for signal from DBUS.
+    
+    ```
 
 - The **Late Check service** - is created as a runtime systemd unit and started from the lightson-ng script itself. The service lives while lightson-ng script is running. As soon as lightson-ng is stopped - the Late Check service is removed from the systemd and can not interfere with the systemd's suspend chain. The service is a one-time service executed when the sleep.target is reached, but before the suspend. If the service do not receive a reply from lightson-ng within 20 seconds, it is stopped passing control back to the systemd.
 - **Stats service** - is launched by lightson-ng script. No systemd unit is created, but only DBUS permissions configuration file is added: `lightson-ng-stat.conf`. Stats service lives while lightson-ng script is running, similar to the Late Check service. Note: permissions are installed permanently, there is no (easy) way to set them runtime.
@@ -493,6 +514,7 @@ When removing PID-file at the end of execution (i.e. when service is stopped), s
 - GUI environment file is removed
 ## Parsing arguments
 Some frequently used configuration options can be set via command line. Mostly, there are logging/debugging options.
+
 | Option | Description |
 |--|--|
 | -d,  --delay \<time in minutes>  | Time interval between checks. Default: 1 min |
@@ -513,11 +535,13 @@ Screensaver detection is used when the use of inhibitors is impossible for some 
 lightson-ng uses some settings stored in Gnome, such as idle-delay, sleep-inactive-ac-timeout, sleep-inactive-battery-timeout to adjust the loop delay. Also, gnome settings are used to restore the default PM settings in GDM schema.
 ## Getting GUI environment variables.
 Lightson-ng is running as a systemd service, not in graphical terminal, having variables such as DISPLAY, DBUS_ADDRESS undefined. While GUI environment variables are needed when installing the gnome-inhibitor, when performing some GUI-dependent checks, when simulating user activity, etc.
+
 Variables are taken from the active GUI (x11) session. If in such session the `gnome-session-binary` process is running, then the session is considered as having a proper GUI variables.
 
 > GUI variables may not be available right after the boot, when no user is logged into X session.
 ## Executing commands with sudo
 GUI-dependent checks are executed under the account of the user who's GUI session is active now.  GUI username and GUI environment variables collected previously are used to run sudo commands.
+
 If no GUI variables were collected, the command is executed as user who is running lightson-ng (usually `root`)
 ## Other packages dependencies
 Ubuntu packages needed for lightson-ng functioning are described in the Installation section.
